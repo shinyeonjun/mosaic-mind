@@ -40,10 +40,15 @@ def article_sessions(sessions: list[dict], part: str) -> list[dict]:
 
 
 class ArticleReading:
-    """The reading specialist with a reading memory (fp32 live; optionally seeded from the v6 bf16 cache)."""
+    """The reading specialist with a reading memory (live, optionally seeded from the v6 bf16 cache).
+    New passages are read in batches (`Reader.read_many`). `precision`: "fp32" (default) or "fp16" (fast
+    mode: 2.3x, 11 of 2,313 test answers differ from fp32, no batch dependence; design/mk1-integration.md)."""
 
-    def __init__(self, device: torch.device, seed_from_cache: bool = False, store=QA_MEMORY):
-        self.device, self.store = device, None if seed_from_cache else store
+    def __init__(self, device: torch.device, seed_from_cache: bool = False, store=QA_MEMORY, precision: str = "fp32"):
+        self.device, self.precision = device, precision
+        if store is not None and precision != "fp32":
+            store = store.with_name(f"{store.stem}-{precision}{store.suffix}")
+        self.store = None if seed_from_cache else store
         self.memo: dict[tuple[str, str], dict] = {}
         self.reader = None
         self.new = 0
@@ -67,11 +72,13 @@ class ArticleReading:
             if self.reader is None:
                 from cognitive_lab.world5.reader_qa import Reader
 
-                self.reader = Reader(self.device)  # fp32
+                self.reader = Reader(self.device, precision=self.precision)
             lines = []
-            for question, passage in missing:
-                self.memo[(question, passage)] = reading = self.reader.read(question, passage)
-                lines.append(json.dumps({"question": question, "passage": passage, "reading": reading}, ensure_ascii=False))
+            for start in range(0, len(missing), 64):
+                chunk = missing[start:start + 64]
+                for (question, passage), reading in zip(chunk, self.reader.read_many(chunk)):
+                    self.memo[(question, passage)] = reading
+                    lines.append(json.dumps({"question": question, "passage": passage, "reading": reading}, ensure_ascii=False))
             self.new += len(missing)
             if self.store is not None:
                 with self.store.open("a", encoding="utf-8") as out:

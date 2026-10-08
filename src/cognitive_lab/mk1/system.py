@@ -96,7 +96,7 @@ def chain_sessions(episodes: list[dict]) -> list[dict]:
 
 class MK1(nn.Module):
     def __init__(self, device: torch.device, seed: int = 42, store=READING_MEMORY, reading: str = "relevant",
-                 precision: str = "fp32", articles_from_cache: bool = False):
+                 precision: str = "fp32", articles_from_cache: bool = False, article_precision: str = "fp32"):
         super().__init__()
         self.device, self.reading = device, reading
         self.reader = ReaderService(device, store=store, precision=precision)
@@ -119,7 +119,7 @@ class MK1(nn.Module):
         self.trust_real.load_state_dict(torch.load(real_trust.CHECKPOINT_DIR / f"world-v6_trust_seed-{seed}.pt",
                                                    map_location="cpu")["state"])
         # Article readings: live fp32, or (wiring check) seeded from the bf16 v6 cache.
-        self.articles = ArticleReading(device, seed_from_cache=articles_from_cache)
+        self.articles = ArticleReading(device, seed_from_cache=articles_from_cache, precision=article_precision)
         self.to(device).eval()
 
     @property

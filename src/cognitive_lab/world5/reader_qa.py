@@ -215,12 +215,16 @@ class Reader:
     """The trained reading specialist for single passages (rule world v6 uses it on report versions).
 
     Reads in fp32 by default (MK1): in bf16 an answer could change with what else was in the batch
-    (10 of 300 test answers did). `precise=False` is the bf16 reading the v5/v6 caches were made with."""
+    (10 of 300 test answers did). `precise=False` is the bf16 reading the v5/v6 caches were made with.
+    `precision="fp16"` is the fast mode (about 2.4x on the laptop GPU; see design/mk1-integration.md)."""
 
-    def __init__(self, device: torch.device, precise: bool = True):
+    def __init__(self, device: torch.device, precise: bool = True, precision: str | None = None):
         from transformers import AutoTokenizer
 
-        self.device, self.precise = device, precise
+        self.device = device
+        self.precision = precision or ("fp32" if precise else "bf16")
+        self.precise = self.precision == "fp32"
+        self.half = {"fp16": torch.float16, "bf16": torch.bfloat16}.get(self.precision)
         self.tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_DIR)
         self.model = load_model(device, trained=True).eval()
 
@@ -230,8 +234,8 @@ class Reader:
         enc = encode(self.tokenizer, [question], [context])
         ids = torch.tensor(enc["input_ids"]).to(self.device)
         mask = torch.tensor(enc["attention_mask"]).to(self.device)
-        with torch.autocast(device_type=self.device.type, dtype=torch.bfloat16,
-                            enabled=self.device.type == "cuda" and not self.precise):
+        with torch.autocast(device_type=self.device.type, dtype=self.half or torch.bfloat16,
+                            enabled=self.device.type == "cuda" and self.half is not None):
             output = self.model(input_ids=ids, attention_mask=mask)
         starts, ends = output.start_logits.float().cpu(), output.end_logits.float().cpu()
         found, null = [], -1e9
@@ -247,6 +251,39 @@ class Reader:
                 found.append((span[f].item(), context[offsets[a][0]:offsets[b][1]].strip()))
         found.sort(reverse=True)
         return found[:k], null
+
+    @torch.no_grad()
+    def read_many(self, pairs: list[tuple[str, str]], batch: int = 16) -> list[dict]:
+        """`read` for many (question, passage) pairs at once: windows of all passages go through the model
+        in batches. Windows are padded to a fixed length, so in fp32 each window's logits do not depend on
+        what it was batched with, and the answers equal one-at-a-time reading."""
+        enc = encode(self.tokenizer, [q for q, _ in pairs], [c for _, c in pairs])
+        ids_all = torch.tensor(enc["input_ids"])
+        mask_all = torch.tensor(enc["attention_mask"])
+        best = [None] * len(pairs)
+        null = [-1e9] * len(pairs)
+        for start in range(0, len(ids_all), batch):
+            ids = ids_all[start:start + batch].to(self.device)
+            mask = mask_all[start:start + batch].to(self.device)
+            with torch.autocast(device_type=self.device.type, dtype=self.half or torch.bfloat16,
+                                enabled=self.device.type == "cuda" and self.half is not None):
+                output = self.model(input_ids=ids, attention_mask=mask)
+            starts, ends = output.start_logits.float().cpu(), output.end_logits.float().cpu()
+            for j in range(len(ids)):
+                i = start + j
+                n = enc["overflow_to_sample_mapping"][i]
+                ctx = [t for t, s in enumerate(enc.sequence_ids(i)) if s == 1]
+                offsets = enc["offset_mapping"][i]
+                null[n] = max(null[n], (starts[j, 0] + ends[j, 0]).item())
+                span = starts[j, ctx][:, None] + ends[j, ctx][None, :]
+                ones = torch.ones_like(span, dtype=torch.bool)
+                span = span.masked_fill(~(ones.triu() & ~ones.triu(MAX_ANSWER_TOKENS)), -1e9).flatten()
+                f = int(span.argmax())
+                a, b = ctx[f // len(ctx)], ctx[f % len(ctx)]
+                found = (span[f].item(), pairs[n][1][offsets[a][0]:offsets[b][1]].strip())
+                if best[n] is None or found > best[n]:
+                    best[n] = found
+        return [{"answer": b[1], "span_score": round(b[0], 4), "null_score": round(z, 4)} for b, z in zip(best, null)]
 
     def read(self, question: str, context: str) -> dict:
         (best,), null = self.spans(question, context, k=1)
