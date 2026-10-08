@@ -10,6 +10,9 @@ Built on v6 article sessions (4 sources with hidden accuracies, 40 KLUE question
 Types (hidden from the system): C (the board states the article door's key; query: chain end),
 A (query: the article door), AC (query: chain end; the article door's key only from the article).
 
+World v11 (`board_accuracies`): each session draws a hidden board accuracy r; in C the board's statement
+about the article door is right with probability r, else it names another key (design/mk1-integration.md, F).
+
 python -m cognitive_lab.world10.world      # sample
 """
 
@@ -24,7 +27,7 @@ from cognitive_lab.world6.reports import covered, load
 TYPES = ("C", "A", "AC")
 
 
-def generate(part: str, seed: int, count: int | None = None) -> list[dict]:
+def generate(part: str, seed: int, count: int | None = None, board_accuracies: tuple | None = None) -> list[dict]:
     """MK1 sessions: {"sources", "linked", "episodes": [...]}; `answer` is the query door's key."""
     questions = {q["guid"]: q for q in klue.load(part)}
     records = load()
@@ -32,6 +35,7 @@ def generate(part: str, seed: int, count: int | None = None) -> list[dict]:
     for s in v6.generate(part, seed, count):
         rng = random.Random(f"world-v10|{s['session_id']}")
         golds = [questions[e["guid"]]["answers"][0] for e in s["episodes"]]
+        board_accuracy = rng.choice(board_accuracies) if board_accuracies else 1.0
         episodes = []
         for t, e in enumerate(s["episodes"]):
             q, record = questions[e["guid"]], records[e["guid"]]
@@ -50,20 +54,27 @@ def generate(part: str, seed: int, count: int | None = None) -> list[dict]:
                 chain_of[base] = [base] + [extras.pop() for _ in range(size)]
                 links += [(chain_of[base][i], chain_of[base][i + 1]) for i in range(size)]
             stated = [d for d in composite.BASE_DOORS if d != article_door and rng.random() < 0.5]
+            said = dict(truths)
+            board_right = None
             if kind == "C":
                 stated.append(article_door)
-            board = [chains.same_text(rng, a, b) for a, b in links] + [chains.fact_text(rng, d, truths[d]) for d in stated]
+                if board_accuracies:
+                    board_right = rng.random() < board_accuracy
+                    if not board_right:
+                        said[article_door] = rng.choice([k for k in chains.KEYS if k != truths[article_door]])
+            board = [chains.same_text(rng, a, b) for a, b in links] + [chains.fact_text(rng, d, said[d]) for d in stated]
             rng.shuffle(board)
             query = article_door if kind == "A" else chain_of[article_door][-1]
             false_passage = covered(q["context"], q["answers"][0], record["fake"])
             episodes.append({
-                "tag": kind, "utterances": [], "board": board, "query": query, "keys": list(chains.KEYS),
+                "tag": kind, "board_right": board_right, "utterances": [], "board": board, "query": query, "keys": list(chains.KEYS),
                 "answer": truths[article_door], "anchor": article_door, "answers": {},
                 "legend": legend, "article": {"door": article_door, "question": q["question"], "answers": q["answers"],
                                               "reports": [{"source": r["speaker"],
                                                            "passage": q["context"] if r["truthful"] else false_passage}
                                                           for r in e["reports"]]}})
-        sessions.append({"speakers": [], "sources": v6.SPEAKERS, "linked": True, "episodes": episodes})
+        sessions.append({"speakers": [], "sources": v6.SPEAKERS, "linked": True, "board_accuracy": board_accuracy,
+                         "episodes": episodes})
     return sessions
 
 

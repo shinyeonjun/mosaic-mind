@@ -18,6 +18,10 @@ Article sessions (stage D, mk1/articles.py): sources hand over passages; the rea
 them (reading.articles), the real-text trust part picks a candidate answer or 모름 (trust_real.logits).
 Which path a session takes is decided by what it brings: passages from sources, or speech and a board.
 
+Stage F (world v11, boards that can be wrong): "arbitrate" lets the arbiter (mk1/arbiter.py) weigh the
+board's and the article's word on the article door and replaces that door's fact with its conclusion;
+"article-only" replaces it with the article part's conclusion; "ask-available" merges both (max).
+
 Linked sessions (stage E, world10): a real article is attached to one base door; the real-text trust part's
 conclusion, turned into a key through the board's key labels, is written as that door's conclusion
 (article -> doors.conclusions), and the router and adapter use it exactly as they use the trust part's.
@@ -32,6 +36,7 @@ not from the precomputed tables they were trained with (those are never loaded h
 import torch
 from torch import nn
 
+from cognitive_lab.mk1.arbiter import Arbiter
 from cognitive_lab.mk1.articles import ArticleReading, trust_inputs
 from cognitive_lab.mk1.board import Blackboard
 from cognitive_lab.mk1.reader import READING_MEMORY, ReaderService
@@ -55,7 +60,7 @@ from cognitive_lab.world7.routing import COST, Router
 from cognitive_lab.world.interface_anchored import hypothesis as fact_hypothesis
 
 STEPS = 16
-POLICIES = ("trust", "think", "ask-all", "ask-available", "route")
+POLICIES = ("trust", "think", "ask-all", "ask-available", "route", "article-only", "arbitrate")
 THINKER_HYPOTHESES = [hypothesis_text(h) for h in hypotheses()]
 
 
@@ -120,6 +125,10 @@ class MK1(nn.Module):
                                                    map_location="cpu")["state"])
         # Article readings: live fp32, or (wiring check) seeded from the bf16 v6 cache.
         self.articles = ArticleReading(device, seed_from_cache=articles_from_cache, precision=article_precision)
+        self.arbiter = Arbiter()
+        arbiter_file = CHECKPOINT_DIR / f"mk1-arbiter_seed-{seed}.pt"
+        if arbiter_file.exists():
+            self.arbiter.load_state_dict(torch.load(arbiter_file, map_location="cpu")["state"])
         self.to(device).eval()
 
     @property
@@ -229,12 +238,13 @@ class MK1(nn.Module):
         board.write("curiosity.asked", torch.stack(asked_speaker, 1).flatten(), "curiosity")
 
     # --- thinker: board (+ facts from other parts) -> answer ---------------------------------------
-    def think(self, board: Blackboard, query: torch.Tensor, facts: dict | None = None):
+    def think(self, board: Blackboard, query: torch.Tensor, facts: dict | None = None, replace: bool = False):
         reading = board.read("reading.board")
         kept = self.thinker.features
         self.thinker.features = reading["features"].to(self.device)
         try:
-            extra = {} if facts is None else {"extra_facts": facts["messages"], "extra_mask": facts["mask"]}
+            extra = {} if facts is None else {"extra_facts": facts["messages"], "extra_mask": facts["mask"],
+                                              "extra_replace": replace}
             logits, _, strength, doors = self.thinker.think(reading["index"].flatten(0, 1).to(self.device), query, STEPS,
                                                             with_links=True, **extra)
         finally:
@@ -308,6 +318,11 @@ class MK1(nn.Module):
             board.write("router.asked", torch.ones(count, 3, dtype=torch.bool, device=self.device), "rule")
         elif policy == "ask-available":  # every door some part has something on
             board.write("router.asked", board.read("doors.available").clone(), "rule")
+        elif policy in ("article-only", "arbitrate"):  # stage F: the article door's fact is replaced
+            if policy == "arbitrate":
+                board.write("thinker.first", self.think(board, query), "thinker")
+                self.arbitrate(board, sessions)
+            board.write("router.asked", board.read("doors.available").clone(), "rule")
         else:
             board.write("thinker.first", self.think(board, query), "thinker")
             self.route(board, query, gate)
@@ -316,7 +331,8 @@ class MK1(nn.Module):
         if asked.any():
             self.transmit(board)
             facts = board.read("facts.from_trust")
-        board.write("answer.logits", self.think(board, query, facts)["answer"], "thinker")
+        replace = policy in ("article-only", "arbitrate")
+        board.write("answer.logits", self.think(board, query, facts, replace)["answer"], "thinker")
         self.reader.save()
         return {"logits": board.read("answer.logits"), "asks": asked.float().sum(1), "speaker_asks": speaker_asks,
                 "targets": targets}, board
@@ -342,6 +358,48 @@ class MK1(nn.Module):
                     conclusions[n, door, labels.index(klue.normalize(found[k]))] = 20.0
         board.write("doors.conclusions", conclusions, "trust-real")
         board.write("doors.available", available, "trust-real")
+
+    def channel_says(self, board: Blackboard, sessions: list[dict]) -> dict:
+        """Per article door: what the board (thinker's first pass, if sure) and the article part (its
+        conclusion) say, as one-hot keys [B,E,2,3] (zeros = nothing); truth [B,E] (revealed after each question)."""
+        episodes = [e for s in sessions for e in s["episodes"]]
+        rows = torch.arange(len(episodes), device=self.device)
+        door = torch.tensor([BASE_DOORS.index(e["article"]["door"]) for e in episodes], device=self.device)
+        belief = board.read("thinker.first")["doors"][rows, door]  # [N,3]
+        board_says = nn.functional.one_hot(belief.argmax(-1), 3).float() * (belief.amax(-1, keepdim=True) > 0.5)
+        article = board.read("doors.conclusions")[rows, door]
+        article_says = nn.functional.one_hot(article.argmax(-1), 3).float() * (article.amax(-1, keepdim=True) > 0)
+        shape = (len(sessions), len(sessions[0]["episodes"]))
+        truth = torch.tensor([e["keys"].index(e["answer"]) for e in episodes], device=self.device)
+        return {"says": torch.stack([board_says, article_says], 1).view(*shape, 2, 3), "truth": truth.view(shape),
+                "door": door}
+
+    def arbitrate(self, board: Blackboard, sessions: list[dict]) -> None:
+        """The arbiter's conclusion about each article door replaces both channels' (as doors.conclusions)."""
+        views = self.channel_says(board, sessions)
+        logits = self.arbiter(views["says"], views["truth"]).flatten(0, 1)  # truth = feedback after each question
+        board.write("arbiter.logits", logits, "arbiter")
+        p = logits.softmax(-1)[:, :3]
+        best, pick = p.max(-1)
+        conclusions = torch.zeros(len(p), 3, 3, device=self.device)
+        rows = torch.arange(len(p), device=self.device)
+        conclusions[rows, views["door"]] = nn.functional.one_hot(pick, 3).float() * 20.0 * (best > 0.5)[:, None]
+        board.write("doors.conclusions", conclusions, "arbiter")
+
+    @torch.no_grad()
+    def channel_views(self, sessions: list[dict], chunk: int = 100) -> dict:
+        """Arbiter training inputs for linked sessions, computed in chunks of sessions."""
+        parts = []
+        for start in range(0, len(sessions), chunk):
+            group = sessions[start:start + chunk]
+            board = Blackboard()
+            query = torch.tensor([chains.DOORS.index(e["query"]) for s in group for e in s["episodes"]], device=self.device)
+            self.read(board, group, False)
+            self.article_doors(board, group)
+            board.write("thinker.first", self.think(board, query), "thinker")
+            parts.append(self.channel_says(board, group))
+        self.reader.save()
+        return {k: torch.cat([p[k] for p in parts]) for k in ("says", "truth")}
 
     @torch.no_grad()
     def solve_articles(self, sessions: list[dict]) -> tuple[dict, Blackboard]:
