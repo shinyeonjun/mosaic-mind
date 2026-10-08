@@ -14,6 +14,10 @@ speakers were asked about: stage 1), "think" (no trust part), "ask-all" (stage 4
 the router decides). `curious=True` adds stage 2: before the trust part answers, the curiosity head may
 ask one speaker about the queried door (only a base door: speakers never talk about other doors).
 
+Article sessions (stage D, mk1/articles.py): sources hand over passages; the reading specialist reads
+them (reading.articles), the real-text trust part picks a candidate answer or 모름 (trust_real.logits).
+Which path a session takes is decided by what it brings: passages from sources, or speech and a board.
+
 The router may only ask the trust part about an episode in which somebody spoke (`trust.heard`); with
 nobody heard, the trust part has nothing to say. (Stage 7 never met such episodes.)
 
@@ -24,6 +28,7 @@ not from the precomputed tables they were trained with (those are never loaded h
 import torch
 from torch import nn
 
+from cognitive_lab.mk1.articles import ArticleReading, trust_inputs
 from cognitive_lab.mk1.board import Blackboard
 from cognitive_lab.mk1.reader import READING_MEMORY, ReaderService
 from cognitive_lab.mk1.relevance import board_relevant, fillers
@@ -39,7 +44,9 @@ from cognitive_lab.world3.features import hypotheses, hypothesis_text
 from cognitive_lab.world3.thinker import MAX_UTTERANCES as BOARD_SLOTS
 from cognitive_lab.world3.thinker import Thinker, fixed_point_stop
 from cognitive_lab.world4.composite import BASE_DOORS
+from cognitive_lab.world5 import klue
 from cognitive_lab.world4.system import CompositeSystem
+from cognitive_lab.world6 import trust as real_trust
 from cognitive_lab.world7.routing import COST, Router
 from cognitive_lab.world.interface_anchored import hypothesis as fact_hypothesis
 
@@ -85,7 +92,7 @@ def chain_sessions(episodes: list[dict]) -> list[dict]:
 
 class MK1(nn.Module):
     def __init__(self, device: torch.device, seed: int = 42, store=READING_MEMORY, reading: str = "relevant",
-                 precision: str = "fp32"):
+                 precision: str = "fp32", articles_from_cache: bool = False):
         super().__init__()
         self.device, self.reading = device, reading
         self.reader = ReaderService(device, store=store, precision=precision)
@@ -104,6 +111,11 @@ class MK1(nn.Module):
         self.curiosity = CuriosityHead()
         self.curiosity.load_state_dict(torch.load(CHECKPOINT_DIR / f"world-v2a_curiosity_cost-0.2_seed-{seed}.pt",
                                                   map_location="cpu")["state"])
+        self.trust_real = real_trust.TrustPart()
+        self.trust_real.load_state_dict(torch.load(real_trust.CHECKPOINT_DIR / f"world-v6_trust_seed-{seed}.pt",
+                                                   map_location="cpu")["state"])
+        # Article readings: live fp32, or (wiring check) seeded from the bf16 v6 cache.
+        self.articles = ArticleReading(device, seed_from_cache=articles_from_cache)
         self.to(device).eval()
 
     @property
@@ -301,20 +313,65 @@ class MK1(nn.Module):
         return {"logits": board.read("answer.logits"), "asks": asked.float().sum(1), "speaker_asks": speaker_asks,
                 "targets": targets}, board
 
+    @torch.no_grad()
+    def solve_articles(self, sessions: list[dict]) -> tuple[dict, Blackboard]:
+        """Article sessions (same number of questions each): answers (candidate text or 모름) per question."""
+        board = Blackboard()
+        episodes = [s["episodes"] for s in sessions]
+        pairs = [(e["question"], r["passage"]) for row in episodes for e in row for r in e["reports"]]
+        flat = iter(self.articles.read(pairs))
+        readings = [[[next(flat) for _ in e["reports"]] for e in row] for row in episodes]
+        board.write("reading.articles", readings, "reader-qa")
+        data, candidates = trust_inputs(episodes, readings, real_trust.SLOTS, real_trust.world.SPEAKERS)
+        logits = self.trust_real({k: v.to(self.device) for k, v in data.items()})  # right = feedback after each question
+        board.write("trust_real.logits", logits, "trust-real")
+        choice = real_trust.choices(logits).flatten().tolist()
+        answers = [c[k] if k >= 0 else "모름" for c, k in zip((c for row in candidates for c in row), choice)]
+        board.write("answer.text", answers, "trust-real")
+        count = len(answers)
+        zeros = torch.zeros(count, device=self.device)
+        return {"answer": answers, "asks": zeros, "speaker_asks": zeros.clone()}, board
+
     def forward(self, sessions: list[dict], policy: str = "route", curious: bool = False, gate: bool = True):
-        """Any mix of sessions: grouped by episode count, solved, and returned in the original order."""
-        groups: dict[int, list[int]] = {}
+        """Any mix of sessions: grouped (articles / rule-world sessions by episode count), solved, and returned in
+        the original order. Every episode gets an answer text (a key, a candidate answer, or 모름); when every
+        session is a rule-world one, the answer logits and targets are returned too."""
+        groups: dict[tuple, list[int]] = {}
         for i, s in enumerate(sessions):
-            groups.setdefault(len(s["episodes"]), []).append(i)
+            groups.setdefault(("articles" if "sources" in s else "rule", len(s["episodes"])), []).append(i)
         parts, boards, offsets, position = [], [], {}, 0
-        for members in groups.values():
-            out, board = self.solve([sessions[i] for i in members], policy, curious, gate)
+        for (kind, _), members in groups.items():
+            chosen = [sessions[i] for i in members]
+            if kind == "articles":
+                out, board = self.solve_articles(chosen)
+            else:
+                out, board = self.solve(chosen, policy, curious, gate)
+                keys = [e["keys"] for s in chosen for e in s["episodes"]]
+                q = out["logits"].softmax(-1)
+                best, pick = q.max(-1)
+                out["answer"] = [k[i] if b > 0.5 else "모름" for k, i, b in zip(keys, pick.tolist(), best.tolist())]
             parts.append(out)
             boards.append(board)
             for i in members:  # where session i's episodes landed in the concatenated output
                 offsets[i] = position
                 position += len(sessions[i]["episodes"])
-        merged = {k: torch.cat([p[k] for p in parts]) for k in parts[0]}
         index = torch.cat([torch.arange(offsets[i], offsets[i] + len(sessions[i]["episodes"]))
                            for i in range(len(sessions))]).to(self.device)
-        return {k: v[index] for k, v in merged.items()}, boards
+        shared = set.intersection(*(set(p) for p in parts))
+        merged = {}
+        for k in shared:
+            if k == "answer":
+                flat = [a for p in parts for a in p["answer"]]
+                merged[k] = [flat[i] for i in index.tolist()]
+            else:
+                merged[k] = torch.cat([p[k] for p in parts])[index]
+        return merged, boards
+
+
+def episode_score(episode: dict, answer: str) -> float:
+    """The world's score (+1 right, 0 for 모름 when an answer exists, -1 wrong; a right 모름 is +1)."""
+    if episode.get("tag") == "article":
+        return 0.0 if answer == "모름" else (1.0 if klue.is_right(answer, episode["answers"]) else -1.0)
+    if answer == "모름":
+        return 0.0 if episode["answer"] in episode["keys"] else 1.0
+    return 1.0 if answer == episode["answer"] else -1.0

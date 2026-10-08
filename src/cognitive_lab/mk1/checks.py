@@ -2,7 +2,7 @@
 
 Run after any change to code a part depends on; every score must match its part card in
 `mk1/registry.py` (tolerance 0.002). A missing part is reported, not skipped silently.
-The board checks ("board:" names) re-measure stages 1-4 and 7 with one MK1 whose parts talk only
+The board checks ("board:" names) re-measure stages 1-4, 6 and 7 with one MK1 whose parts talk only
 through the blackboard and read live (mk1/system.py): wiring must not change any score.
 
 python -m cognitive_lab.mk1.checks            # all
@@ -186,6 +186,21 @@ def board_stage4(device):
     return round(scores(out["logits"], out["targets"]).mean().item(), 4)
 
 
+def board_stage6(device):
+    """Real articles: sources hand over passages and MK1 reads them. The reading memory is seeded from the
+    v6 cache (bf16), so the trust part sees what it graduated on; live fp32 reading is measured in stage D."""
+    from cognitive_lab.mk1.articles import article_sessions
+    from cognitive_lab.mk1.system import MK1, episode_score
+    from cognitive_lab.world6 import world
+
+    if ("cache", device) not in _MK1:
+        _MK1[("cache", device)] = MK1(device, articles_from_cache=True)
+    sessions = article_sessions(world.generate("test", 42), "test")
+    out, _ = _MK1[("cache", device)](sessions)
+    episodes = [e for s in sessions for e in s["episodes"]]
+    return round(sum(episode_score(e, a) for e, a in zip(episodes, out["answer"])) / len(episodes), 4)
+
+
 def board_stage7(device):
     from cognitive_lab.mk1.system import composite_sessions
     from cognitive_lab.world3.thinker import scores
@@ -199,7 +214,7 @@ def board_stage7(device):
 
 
 BOARD_CHECKS = {"stage1-trust": board_stage1, "stage2-curiosity": board_stage2, "stage3-thinker": board_stage3, "stage4-composite": board_stage4,
-                "stage7-router": board_stage7}
+                "stage6-trust-real": board_stage6, "stage7-router": board_stage7}
 
 
 CHECKS = {"reader-parity": reader_parity, "stage1-trust": stage1_trust, "stage2-curiosity": stage2_curiosity,
