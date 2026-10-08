@@ -88,9 +88,13 @@ class CountingArbiter(nn.Module):
             self.device = torch.device(device)
         return super().to(*args, **kwargs)
 
-    def step(self, said: torch.Tensor, memory: torch.Tensor) -> torch.Tensor:
+    def accuracy(self, memory: torch.Tensor) -> torch.Tensor:
+        """Each channel's estimated accuracy [B,C]: the Beta posterior mean of its counts."""
         alpha, beta = self.log_prior.exp()
-        accuracy = ((memory[..., 0] + alpha) / (memory[..., 1] + alpha + beta))[..., None]  # [B,C,1]
+        return (memory[..., 0] + alpha) / (memory[..., 1] + alpha + beta)
+
+    def step(self, said: torch.Tensor, memory: torch.Tensor) -> torch.Tensor:
+        accuracy = self.accuracy(memory)[..., None]  # [B,C,1]
         spoke = said.amax(-1, keepdim=True)  # [B,C,1]
         keys = said.shape[-1]
         likelihood = torch.where(said > 0, accuracy, (1 - accuracy) / (keys - 1))
@@ -111,6 +115,55 @@ class CountingArbiter(nn.Module):
         return torch.stack(out, 1)
 
 
+class ChangeArbiter(CountingArbiter):
+    """The counting arbiter that also notices when a channel's reliability changes (MK1 stage K).
+
+    Bayesian online change-point detection (Adams & MacKay 2007) per channel: the memory holds a distribution over
+    the run length r (observations of this channel since its last change) and, per r, the counts of that run. The
+    channel's accuracy is the mixture over r of the Beta(alpha, beta) posterior means. Each observation either
+    continues every run (prob 1 - h) or starts a new one (prob h); an observation the current runs found unlikely
+    moves the mass to short runs, so old evidence stops counting: unexpected uncertainty, the role Yu & Dayan give
+    norepinephrine (design/neuroscience-review-2026-10-09.md, 4). Learned numbers: alpha, beta, h.
+    The learned prior Beta(alpha, beta) is only for the run that began with the session (a channel met for the first
+    time); a run that begins at a change starts from Beta(1, 1): after a betrayal, old expectations are dropped. (With
+    the learned prior for every run, a trusted board that began to mislead kept being followed for many questions.)
+    Run lengths go up to `max_run - 1`; sessions are 40 questions, so 41 bins never overflow."""
+
+    def __init__(self, learn: bool = False, max_run: int = 41):
+        super().__init__(learn_prior=learn)
+        self.logit_hazard = nn.Parameter(torch.tensor(-3.0), requires_grad=learn)  # h = sigmoid(-3) = 0.05
+        self.max_run = max_run
+
+    def initial_memory(self, batch: int, channels: int = 2) -> torch.Tensor:
+        memory = torch.zeros(batch, channels, self.max_run, 4, device=self._device)  # [weight, right, spoke, first run?]
+        memory[:, :, 0, 0] = 1.0
+        memory[:, :, 0, 3] = 1.0
+        return memory
+
+    def _run_accuracy(self, memory: torch.Tensor) -> torch.Tensor:
+        alpha, beta = self.log_prior.exp()
+        first = memory[..., 3]
+        a, b = first * alpha + (1 - first), first * beta + (1 - first)  # learned prior for the first run, else Beta(1, 1)
+        return (memory[..., 1] + a) / (memory[..., 2] + a + b)  # [B,C,L]
+
+    def accuracy(self, memory: torch.Tensor) -> torch.Tensor:
+        return (memory[..., 0] * self._run_accuracy(memory)).sum(-1)
+
+    def update(self, memory: torch.Tensor, said: torch.Tensor, truth: torch.Tensor) -> torch.Tensor:
+        spoke = said.amax(-1)  # [B,C]
+        right = said.gather(-1, truth[:, None, None].expand(-1, said.shape[1], 1)).squeeze(-1)  # [B,C]
+        h = torch.sigmoid(self.logit_hazard)
+        run_accuracy = self._run_accuracy(memory)
+        joint = memory[..., 0] * torch.where(right[..., None] > 0, run_accuracy, 1 - run_accuracy)  # [B,C,L]
+        weight = torch.cat([joint.sum(-1, keepdim=True) * h, joint[..., :-1] * (1 - h)], -1)  # new run | runs grow by 1
+        weight = weight / weight.sum(-1, keepdim=True)
+        counts = torch.cat([torch.zeros_like(memory[..., :1, 1:3]), memory[..., :-1, 1:3]], -2)  # shift runs by one
+        counts = counts + torch.stack([right, torch.ones_like(right)], -1)[..., None, :]  # all runs see this observation
+        first = torch.cat([torch.zeros_like(memory[..., :1, 3:]), memory[..., :-1, 3:]], -2)  # a new run is not the first
+        new = torch.cat([weight[..., None], counts, first], -1)
+        return torch.where(spoke[..., None, None] > 0, new, memory)  # a silent channel learns nothing
+
+
 def door_scores(logits: torch.Tensor, truth: torch.Tensor) -> torch.Tensor:
     """+1 right key, -1 wrong key, 0 모름 (the article door always has a key)."""
     p = logits.softmax(-1)[..., :3]
@@ -127,7 +180,9 @@ def main() -> None:
     parser.add_argument("--train-sessions", type=int, default=600)
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--tag", default="", help="checkpoint name suffix (revisions)")
-    parser.add_argument("--kind", choices=("learned", "counting"), default="learned")
+    parser.add_argument("--kind", choices=("learned", "counting", "change"), default="learned")
+    parser.add_argument("--switch", action="store_true",
+                        help="stage K: training sessions where the board's accuracy may change mid-session")
     args = parser.parse_args()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     torch.manual_seed(args.seed)
@@ -136,10 +191,16 @@ def main() -> None:
     views = {}
     for part, seed, count in (("train", args.seed, args.train_sessions), ("validation", 0, None)):
         sessions = world.generate(part, seed, count, board_accuracies=BOARD_ACCURACIES)
+        if args.switch:  # stage K experience: a third no change, a third mild changes, a third betrayals
+            third = len(sessions) // 3
+            sessions = (sessions[:third]
+                        + world.generate(part, seed + 1000, third, board_accuracies=BOARD_ACCURACIES, switch=True)
+                        + world.generate(part, seed + 2000, len(sessions) - 2 * third, board_accuracies=(1.0, 0.75),
+                                         switch=True, switch_to=(0.25,)))
         views[part] = {k: v.to(device) for k, v in model.channel_views(sessions).items()}
         print(f"{part}: {len(sessions)} sessions ({time.perf_counter() - started:.0f}s)", flush=True)
-    if args.kind == "counting":  # stage I: two numbers, the starting belief Beta(alpha, beta), fitted full-batch
-        arbiter = CountingArbiter(learn_prior=True).to(device)
+    if args.kind in ("counting", "change"):  # stage I/K: alpha, beta (and the change rate h), fitted full-batch
+        arbiter = (CountingArbiter(learn_prior=True) if args.kind == "counting" else ChangeArbiter(learn=True)).to(device)
         optimizer = torch.optim.Adam(arbiter.parameters(), lr=0.05)
         train = views["train"]
         for _ in range(150):
@@ -150,9 +211,10 @@ def main() -> None:
         alpha, beta = arbiter.log_prior.exp().tolist()
         with torch.no_grad():
             value = door_scores(arbiter(views["validation"]["says"], views["validation"]["truth"]), views["validation"]["truth"]).mean().item()
-        path = CHECKPOINT_DIR / f"mk1-arbiter-counting_seed-{args.seed}.pt"
-        torch.save({"state": arbiter.state_dict(), "alpha": alpha, "beta": beta}, path)
-        print(f"prior Beta({alpha:.2f}, {beta:.2f}), validation door score {value:.4f}; saved {path}")
+        path = CHECKPOINT_DIR / f"mk1-arbiter-{args.kind}{'-switch' if args.switch else ''}_seed-{args.seed}.pt"
+        hazard = torch.sigmoid(arbiter.logit_hazard).item() if args.kind == "change" else None
+        torch.save({"state": arbiter.state_dict(), "alpha": alpha, "beta": beta, "hazard": hazard}, path)
+        print(f"prior Beta({alpha:.2f}, {beta:.2f}), hazard {hazard}, validation door score {value:.4f}; saved {path}")
         return
     arbiter = Arbiter().to(device)
     optimizer = torch.optim.Adam(arbiter.parameters(), lr=3e-3)

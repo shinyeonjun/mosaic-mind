@@ -45,7 +45,7 @@ not from the precomputed tables they were trained with (those are never loaded h
 import torch
 from torch import nn
 
-from cognitive_lab.mk1.arbiter import Arbiter, CountingArbiter
+from cognitive_lab.mk1.arbiter import Arbiter, ChangeArbiter, CountingArbiter
 from cognitive_lab.mk1.arbiter import door_scores as door_score
 from cognitive_lab.mk1.articles import ArticleReading, trust_inputs
 from cognitive_lab.mk1.board import Blackboard
@@ -141,9 +141,13 @@ class MK1(nn.Module):
         self.memory = None  # stage H: a LongTermMemory (mk1/memory.py), if one is attached
         self.recalls: list[bool] = []  # per article question answered: did the memory answer it
         # "learned" (stage F, GRU memory) or "counting" (stage I: counts + a fitted Beta prior)
-        self.arbiter = Arbiter() if arbiter == "learned" else CountingArbiter(learn_prior=True)
+        # "learned" (stage F, GRU), "counting" (stage I), "counting-switch" / "change-switch" (stage K: fitted on
+        # sessions where the board may change mid-way; "change" adds change-point detection)
+        self.arbiter = {"learned": Arbiter, "counting": lambda: CountingArbiter(learn_prior=True),
+                        "counting-switch": lambda: CountingArbiter(learn_prior=True),
+                        "change-switch": lambda: ChangeArbiter(learn=True)}[arbiter]()
         arbiter_file = CHECKPOINT_DIR / (f"mk1-arbiter_seed-{seed}.pt" if arbiter == "learned"
-                                         else f"mk1-arbiter-counting_seed-{seed}.pt")
+                                         else f"mk1-arbiter-{arbiter}_seed-{seed}.pt")
         if arbiter_file.exists():
             self.arbiter.load_state_dict(torch.load(arbiter_file, map_location="cpu")["state"])
         self.to(device).eval()
