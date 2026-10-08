@@ -134,6 +134,8 @@ class MK1(nn.Module):
         # Article readings: live fp32, or (wiring check) seeded from the bf16 v6 cache.
         self.articles = ArticleReading(device, seed_from_cache=articles_from_cache, precision=article_precision)
         self.verifier = None  # stage G: a router retrained for verifying, if one is loaded
+        self.memory = None  # stage H: a LongTermMemory (mk1/memory.py), if one is attached
+        self.recalls: list[bool] = []  # per article question answered: did the memory answer it
         self.arbiter = Arbiter()
         arbiter_file = CHECKPOINT_DIR / f"mk1-arbiter_seed-{seed}.pt"
         if arbiter_file.exists():
@@ -387,7 +389,16 @@ class MK1(nn.Module):
         article_says = nn.functional.one_hot(article.argmax(-1), 3).float() * (article.amax(-1, keepdim=True) > 0)
         shape = (len(sessions), len(sessions[0]["episodes"]))
         truth = torch.tensor([e["keys"].index(e["answer"]) for e in episodes], device=self.device)
-        return {"says": torch.stack([board_says, article_says], 1).view(*shape, 2, 3), "truth": truth.view(shape),
+        channels = [board_says, article_says]
+        if self.memory is not None:  # stage H: the long-term memory as a third channel (the arbiter is name-free)
+            memory_says = torch.zeros_like(board_says)
+            for n, e in enumerate(episodes):
+                known = self.memory.recall(e["article"]["question"])
+                labels = [klue.normalize(e["legend"][key]) for key in e["keys"]]
+                if known is not None and klue.normalize(known) in labels:
+                    memory_says[n, labels.index(klue.normalize(known))] = 1.0
+            channels.append(memory_says)
+        return {"says": torch.stack(channels, 1).view(*shape, len(channels), 3), "truth": truth.view(shape),
                 "door": door}
 
     def arbitrate(self, board: Blackboard, sessions: list[dict]) -> None:
@@ -472,6 +483,17 @@ class MK1(nn.Module):
         board.write("trust_real.logits", logits, "trust-real")
         choice = real_trust.choices(logits).flatten().tolist()
         answers = [c[k] if k >= 0 else "모름" for c, k in zip((c for row in candidates for c in row), choice)]
+        if self.memory is not None:  # stage H: what the world confirmed before is known
+            flat_episodes = [e for row in episodes for e in row]
+            recalled = [self.memory.recall(e["question"]) for e in flat_episodes]
+            board.write("memory.recall", recalled, "memory")
+            answers = [r if r is not None else a for r, a in zip(recalled, answers)]
+            self.recalls += [r is not None for r in recalled]
+            right = data["right"].flatten(0, 1).tolist()
+            for e, found, ok in zip(flat_episodes, (c for row in candidates for c in row), right):
+                hits = [c for c, r in zip(found, ok) if r]
+                if hits:  # feedback after the question: this candidate was right
+                    self.memory.confirm(e["question"], hits[0])
         board.write("answer.text", answers, "trust-real")
         count = len(answers)
         zeros = torch.zeros(count, device=self.device)
