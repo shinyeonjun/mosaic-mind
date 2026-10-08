@@ -4,7 +4,7 @@ A turn, for a batch of sessions (episodes in order; the world reveals each answe
   reader    -> reading.trust, reading.board  live frozen-reader features for what was said / posted
   curiosity -> curiosity.asked               (optional) which speaker to ask about the queried door
   reader    -> reading.answers               what the asked speakers answered (the world answers)
-  trust     -> trust.door_logits, trust.heard  per base door, from speakers + memory of who was right
+  trust     -> doors.conclusions, doors.available  per base door, from speakers + memory of who was right
   thinker   -> thinker.first                 first pass over the board alone
   router    -> router.asked                  which base doors to ask the trust part about
   adapter   -> facts.from_trust              the asked doors' conclusions as thinker fact messages
@@ -18,8 +18,12 @@ Article sessions (stage D, mk1/articles.py): sources hand over passages; the rea
 them (reading.articles), the real-text trust part picks a candidate answer or 모름 (trust_real.logits).
 Which path a session takes is decided by what it brings: passages from sources, or speech and a board.
 
-The router may only ask the trust part about an episode in which somebody spoke (`trust.heard`); with
-nobody heard, the trust part has nothing to say. (Stage 7 never met such episodes.)
+Linked sessions (stage E, world10): a real article is attached to one base door; the real-text trust part's
+conclusion, turned into a key through the board's key labels, is written as that door's conclusion
+(article -> doors.conclusions), and the router and adapter use it exactly as they use the trust part's.
+
+The router may only ask about a base door some part has something on (`doors.available`): a door nobody
+spoke about in an episode, or a door no article is attached to. (Stage 7 never met such episodes.)
 
 The parts are the saved ones, unchanged. Only their wiring is new: they get features from the board,
 not from the precomputed tables they were trained with (those are never loaded here).
@@ -51,7 +55,7 @@ from cognitive_lab.world7.routing import COST, Router
 from cognitive_lab.world.interface_anchored import hypothesis as fact_hypothesis
 
 STEPS = 16
-POLICIES = ("trust", "think", "ask-all", "route")
+POLICIES = ("trust", "think", "ask-all", "ask-available", "route")
 THINKER_HYPOTHESES = [hypothesis_text(h) for h in hypotheses()]
 
 
@@ -178,8 +182,8 @@ class MK1(nn.Module):
     def trust_turn(self, board: Blackboard, feedback: dict, query: torch.Tensor, curious: bool) -> None:
         count = query.numel()
         if not board.has("reading.trust"):  # nobody spoke anywhere in this batch
-            board.write("trust.door_logits", torch.zeros(count, 3, 3, device=self.device), "trust")
-            board.write("trust.heard", torch.zeros(count, dtype=torch.bool, device=self.device), "trust")
+            board.write("doors.conclusions", torch.zeros(count, 3, 3, device=self.device), "trust")
+            board.write("doors.available", torch.zeros(count, 3, dtype=torch.bool, device=self.device), "trust")
             board.write("curiosity.asked", torch.full((count,), -1, device=self.device), "curiosity")
             return
         reading = board.read("reading.trust")
@@ -220,8 +224,8 @@ class MK1(nn.Module):
             asked_speaker.append(target)
             out.append(torch.stack([judge.logits(h[:, d], spoke, memory) for d in range(3)], 1))
             memory = judge.update(memory, h[rows, feedback["anchor"][:, t]], spoke, feedback["truths"][:, t])
-        board.write("trust.door_logits", torch.stack(out, 1).flatten(0, 1), "trust")
-        board.write("trust.heard", (speakers >= 0).any(-1).flatten(), "trust")
+        board.write("doors.conclusions", torch.stack(out, 1).flatten(0, 1), "trust")
+        board.write("doors.available", (speakers >= 0).any(-1).flatten()[:, None].expand(-1, 3), "trust")
         board.write("curiosity.asked", torch.stack(asked_speaker, 1).flatten(), "curiosity")
 
     # --- thinker: board (+ facts from other parts) -> answer ---------------------------------------
@@ -253,12 +257,12 @@ class MK1(nn.Module):
                                 first["answer"].softmax(-1).amax(-1, keepdim=True).expand(-1, 3)], -1)
         asked = self.router(features) > COST
         if gate:
-            asked = asked & board.read("trust.heard")[:, None]
+            asked = asked & board.read("doors.available")
         board.write("router.asked", asked, "router")
 
     # --- adapter: trust conclusions for the asked doors -> thinker fact messages --------------------
     def transmit(self, board: Blackboard) -> None:
-        q = board.read("trust.door_logits").softmax(-1)
+        q = board.read("doors.conclusions").softmax(-1)
         asked = board.read("router.asked")
         sure = q.amax(-1, keepdim=True) > 0.5
         crisp = torch.where(sure, nn.functional.one_hot(q.argmax(-1), 3).float(), torch.full_like(q, 1 / 3))
@@ -283,7 +287,9 @@ class MK1(nn.Module):
         targets = torch.tensor([e["keys"].index(e["answer"]) if e["answer"] in e["keys"] else -1 for e in flat],
                                device=self.device)
         self.read(board, sessions, curious)
-        if policy != "think":
+        if policy != "think" and sessions[0].get("linked"):
+            self.article_doors(board, sessions)
+        elif policy != "think":
             anchors = [BASE_DOORS.index(e["anchor"]) if e["anchor"] is not None else 0 for e in flat]
             feedback = {"truths": targets.clamp(min=0).view(len(sessions), episodes),
                         "anchor": torch.tensor(anchors, device=self.device).view(len(sessions), episodes)}
@@ -291,7 +297,7 @@ class MK1(nn.Module):
         speaker_asks = ((board.read("curiosity.asked") >= 0).float() if board.has("curiosity.asked")
                         else torch.zeros(count, device=self.device))
         if policy == "trust":  # the trust part alone answers about the speakers' door (the v2-H question)
-            answer = board.read("trust.door_logits")[torch.arange(count, device=self.device), feedback["anchor"].flatten()]
+            answer = board.read("doors.conclusions")[torch.arange(count, device=self.device), feedback["anchor"].flatten()]
             board.write("answer.logits", answer, "trust")
             self.reader.save()
             return {"logits": answer, "asks": torch.zeros(count, device=self.device), "speaker_asks": speaker_asks,
@@ -300,6 +306,8 @@ class MK1(nn.Module):
             board.write("router.asked", torch.zeros(count, 3, dtype=torch.bool, device=self.device), "rule")
         elif policy == "ask-all":
             board.write("router.asked", torch.ones(count, 3, dtype=torch.bool, device=self.device), "rule")
+        elif policy == "ask-available":  # every door some part has something on
+            board.write("router.asked", board.read("doors.available").clone(), "rule")
         else:
             board.write("thinker.first", self.think(board, query), "thinker")
             self.route(board, query, gate)
@@ -312,6 +320,28 @@ class MK1(nn.Module):
         self.reader.save()
         return {"logits": board.read("answer.logits"), "asks": asked.float().sum(1), "speaker_asks": speaker_asks,
                 "targets": targets}, board
+
+    def article_doors(self, board: Blackboard, sessions: list[dict]) -> None:
+        """Linked sessions: the article part's conclusion about the article door, as a key (via the labels)."""
+        articles = [[e["article"] for e in s["episodes"]] for s in sessions]
+        pairs = [(a["question"], r["passage"]) for row in articles for a in row for r in a["reports"]]
+        flat = iter(self.articles.read(pairs))
+        readings = [[[next(flat) for _ in a["reports"]] for a in row] for row in articles]
+        board.write("reading.articles", readings, "reader-qa")
+        data, candidates = trust_inputs(articles, readings, real_trust.SLOTS, real_trust.world.SPEAKERS)
+        choice = real_trust.choices(self.trust_real({k: v.to(self.device) for k, v in data.items()})).flatten().tolist()
+        episodes = [e for s in sessions for e in s["episodes"]]
+        conclusions = torch.zeros(len(episodes), 3, 3, device=self.device)  # uniform = 모름
+        available = torch.zeros(len(episodes), 3, dtype=torch.bool, device=self.device)
+        for n, (e, found, k) in enumerate(zip(episodes, (c for row in candidates for c in row), choice)):
+            door = BASE_DOORS.index(e["article"]["door"])
+            available[n, door] = True
+            if k >= 0:
+                labels = [klue.normalize(e["legend"][key]) for key in e["keys"]]
+                if klue.normalize(found[k]) in labels:  # the chosen answer names a key
+                    conclusions[n, door, labels.index(klue.normalize(found[k]))] = 20.0
+        board.write("doors.conclusions", conclusions, "trust-real")
+        board.write("doors.available", available, "trust-real")
 
     @torch.no_grad()
     def solve_articles(self, sessions: list[dict]) -> tuple[dict, Blackboard]:
@@ -338,7 +368,8 @@ class MK1(nn.Module):
         session is a rule-world one, the answer logits and targets are returned too."""
         groups: dict[tuple, list[int]] = {}
         for i, s in enumerate(sessions):
-            groups.setdefault(("articles" if "sources" in s else "rule", len(s["episodes"])), []).append(i)
+            kind = "articles" if "sources" in s and not s.get("linked") else "rule"
+            groups.setdefault((kind, len(s["episodes"])), []).append(i)
         parts, boards, offsets, position = [], [], {}, 0
         for (kind, _), members in groups.items():
             chosen = [sessions[i] for i in members]

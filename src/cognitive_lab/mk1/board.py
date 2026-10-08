@@ -8,7 +8,9 @@ and the board follows the same rule.
 Slots (batched tensors; N = episodes in the batch, D = doors, K = keys):
   reading.index      [N, U]          sentence ids into the reading table (pad = S)
   reading.table      [S, H, 768]     frozen-reader features: S sentences x H hypotheses
-  trust.door_logits  [N, 3, K]       the trust part's view of each base door (from speakers + memory)
+  doors.conclusions  [N, 3, K]       a part's view of each base door (trust part: speakers + memory;
+                                     article part: a real article, via the key labels)
+  doors.available    [N, 3] bool     base doors some part has something on
   thinker.first      dict            the thinker's first pass: answer logits, door beliefs, links
   router.asked       [N, 3] bool     base doors the router asks the trust part about
   answer.logits      [N, K]          the final answer (모름 when no key passes 0.5)
