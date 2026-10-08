@@ -30,22 +30,33 @@ class Arbiter(nn.Module):
         self.contribution = nn.Sequential(nn.Linear(1 + memory, width), nn.Tanh(), nn.Linear(width, 1))
         self.none = nn.Sequential(nn.Linear(1 + memory, width), nn.Tanh(), nn.Linear(width, 1))
 
+    def initial_memory(self, batch: int, channels: int = 2) -> torch.Tensor:
+        return self.memory_initial.expand(batch, channels, -1)
+
+    def step(self, said: torch.Tensor, memory: torch.Tensor) -> torch.Tensor:
+        """said [B,C,3] one-hot (zeros = nothing), memory [B,C,M] -> logits [B,4] (3 keys, 모름)."""
+        spoke = said.amax(-1)  # [B,C]
+        mem = memory[:, :, None, :].expand(-1, -1, said.shape[-1], -1)
+        contribution = self.contribution(torch.cat([said[..., None], mem], -1)).squeeze(-1) * spoke[..., None]
+        none = self.none(torch.cat([spoke[..., None], memory], -1)).squeeze(-1).mean(1, keepdim=True)
+        return torch.cat([contribution.sum(1), none], -1)
+
+    def update(self, memory: torch.Tensor, said: torch.Tensor, truth: torch.Tensor) -> torch.Tensor:
+        """After the answer is revealed: each channel remembers whether it spoke and was right."""
+        batch, channels = said.shape[:2]
+        spoke = said.amax(-1)
+        right = said.gather(-1, truth[:, None, None].expand(-1, channels, 1)).squeeze(-1)  # [B,C]
+        update = torch.stack([spoke, right, spoke - right], -1)
+        return self.memory_cell(update.reshape(-1, 3), memory.reshape(batch * channels, -1)).view(batch, channels, -1)
+
     def forward(self, says: torch.Tensor, truth: torch.Tensor) -> torch.Tensor:
         """says [B,E,C,3] one-hot per channel (all zero = said nothing), truth [B,E] (feedback after each
         question) -> logits [B,E,4] (3 keys, 모름)."""
-        batch, episodes, channels, keys = says.shape
-        memory = self.memory_initial.expand(batch, channels, -1)
+        memory = self.initial_memory(says.shape[0], says.shape[2])
         out = []
-        for t in range(episodes):
-            said = says[:, t]  # [B,C,3]
-            spoke = said.amax(-1)  # [B,C]
-            mem = memory[:, :, None, :].expand(-1, -1, keys, -1)
-            contribution = self.contribution(torch.cat([said[..., None], mem], -1)).squeeze(-1) * spoke[..., None]
-            none = self.none(torch.cat([spoke[..., None], memory], -1)).squeeze(-1).mean(1, keepdim=True)
-            out.append(torch.cat([contribution.sum(1), none], -1))
-            right = said.gather(-1, truth[:, t, None, None].expand(-1, channels, 1)).squeeze(-1)  # [B,C]
-            update = torch.stack([spoke, right, spoke - right], -1)
-            memory = self.memory_cell(update.reshape(-1, 3), memory.reshape(batch * channels, -1)).view(batch, channels, -1)
+        for t in range(says.shape[1]):
+            out.append(self.step(says[:, t], memory))
+            memory = self.update(memory, says[:, t], truth[:, t])
         return torch.stack(out, 1)
 
 

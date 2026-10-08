@@ -22,6 +22,12 @@ Stage F (world v11, boards that can be wrong): "arbitrate" lets the arbiter (mk1
 board's and the article's word on the article door and replaces that door's fact with its conclusion;
 "article-only" replaces it with the article part's conclusion; "ask-available" merges both (max).
 
+Stage G: "verify-*" decide per question whether to ask the article part about the article door although
+the board may already say something. The router sees the arbiter's confidence before asking (which knows
+how often the board has been right this session) in place of the thinker's raw belief. Asking changes what
+the arbiter remembers, so questions are taken in order (verify_loop). "verify-hindsight" knows the answer
+(an upper bound for deciding when to ask, not a policy).
+
 Linked sessions (stage E, world10): a real article is attached to one base door; the real-text trust part's
 conclusion, turned into a key through the board's key labels, is written as that door's conclusion
 (article -> doors.conclusions), and the router and adapter use it exactly as they use the trust part's.
@@ -37,6 +43,7 @@ import torch
 from torch import nn
 
 from cognitive_lab.mk1.arbiter import Arbiter
+from cognitive_lab.mk1.arbiter import door_scores as door_score
 from cognitive_lab.mk1.articles import ArticleReading, trust_inputs
 from cognitive_lab.mk1.board import Blackboard
 from cognitive_lab.mk1.reader import READING_MEMORY, ReaderService
@@ -60,7 +67,8 @@ from cognitive_lab.world7.routing import COST, Router
 from cognitive_lab.world.interface_anchored import hypothesis as fact_hypothesis
 
 STEPS = 16
-POLICIES = ("trust", "think", "ask-all", "ask-available", "route", "article-only", "arbitrate")
+POLICIES = ("trust", "think", "ask-all", "ask-available", "route", "article-only", "arbitrate",
+            "verify-never", "verify-always", "verify-router", "verify-hindsight")
 THINKER_HYPOTHESES = [hypothesis_text(h) for h in hypotheses()]
 
 
@@ -125,6 +133,7 @@ class MK1(nn.Module):
                                                    map_location="cpu")["state"])
         # Article readings: live fp32, or (wiring check) seeded from the bf16 v6 cache.
         self.articles = ArticleReading(device, seed_from_cache=articles_from_cache, precision=article_precision)
+        self.verifier = None  # stage G: a router retrained for verifying, if one is loaded
         self.arbiter = Arbiter()
         arbiter_file = CHECKPOINT_DIR / f"mk1-arbiter_seed-{seed}.pt"
         if arbiter_file.exists():
@@ -254,8 +263,8 @@ class MK1(nn.Module):
         return {"answer": logits[stop, rows], "doors": doors[stop, rows].softmax(-1), "strength": strength}
 
     # --- router: what is missing -> which base doors to ask -----------------------------------------
-    def route(self, board: Blackboard, query: torch.Tensor, gate: bool = True) -> None:
-        first = board.read("thinker.first")
+    def router_features(self, first: dict, query: torch.Tensor) -> torch.Tensor:
+        """Per base door [N,3,3]: [linked to the queried door, sureness of its key, sureness of the answer]."""
         count, doors = len(query), len(chains.DOORS)
         adjacency = torch.zeros(count, doors, doors, device=self.device)
         adjacency[:, self.thinker.pair_rows, self.thinker.pair_cols] = (first["strength"] > 0.5).float()
@@ -263,17 +272,19 @@ class MK1(nn.Module):
         reach = nn.functional.one_hot(query, doors).float()
         for _ in range(doors):
             reach = ((reach[:, None, :] @ adjacency).squeeze(1) > 0).float()
-        features = torch.stack([reach[:, :3], first["doors"][:, :3].amax(-1),
-                                first["answer"].softmax(-1).amax(-1, keepdim=True).expand(-1, 3)], -1)
-        asked = self.router(features) > COST
+        return torch.stack([reach[:, :3], first["doors"][:, :3].amax(-1),
+                            first["answer"].softmax(-1).amax(-1, keepdim=True).expand(-1, 3)], -1)
+
+    def route(self, board: Blackboard, query: torch.Tensor, gate: bool = True) -> None:
+        asked = self.router(self.router_features(board.read("thinker.first"), query)) > COST
         if gate:
             asked = asked & board.read("doors.available")
         board.write("router.asked", asked, "router")
 
     # --- adapter: trust conclusions for the asked doors -> thinker fact messages --------------------
-    def transmit(self, board: Blackboard) -> None:
+    def transmit(self, board: Blackboard, mask: torch.Tensor | None = None) -> None:
         q = board.read("doors.conclusions").softmax(-1)
-        asked = board.read("router.asked")
+        asked = board.read("router.asked") if mask is None else mask
         sure = q.amax(-1, keepdim=True) > 0.5
         crisp = torch.where(sure, nn.functional.one_hot(q.argmax(-1), 3).float(), torch.full_like(q, 1 / 3))
         messages = torch.tanh(self.composite.adapter(torch.stack([crisp, crisp.amax(-1, keepdim=True).expand_as(crisp)], -1)))
@@ -318,6 +329,9 @@ class MK1(nn.Module):
             board.write("router.asked", torch.ones(count, 3, dtype=torch.bool, device=self.device), "rule")
         elif policy == "ask-available":  # every door some part has something on
             board.write("router.asked", board.read("doors.available").clone(), "rule")
+        elif policy.startswith("verify-"):  # stage G: ask to verify, decided per question in order
+            board.write("thinker.first", self.think(board, query), "thinker")
+            self.verify_loop(board, sessions, query, policy.removeprefix("verify-"))
         elif policy in ("article-only", "arbitrate"):  # stage F: the article door's fact is replaced
             if policy == "arbitrate":
                 board.write("thinker.first", self.think(board, query), "thinker")
@@ -328,10 +342,12 @@ class MK1(nn.Module):
             self.route(board, query, gate)
         asked = board.read("router.asked")
         facts = None
-        if asked.any():
-            self.transmit(board)
+        verify = policy.startswith("verify-")
+        fact_doors = board.read("doors.available") if verify else asked  # verify: the arbiter's word always replaces
+        if fact_doors.any():
+            self.transmit(board, fact_doors)
             facts = board.read("facts.from_trust")
-        replace = policy in ("article-only", "arbitrate")
+        replace = policy in ("article-only", "arbitrate") or verify
         board.write("answer.logits", self.think(board, query, facts, replace)["answer"], "thinker")
         self.reader.save()
         return {"logits": board.read("answer.logits"), "asks": asked.float().sum(1), "speaker_asks": speaker_asks,
@@ -385,6 +401,47 @@ class MK1(nn.Module):
         rows = torch.arange(len(p), device=self.device)
         conclusions[rows, views["door"]] = nn.functional.one_hot(pick, 3).float() * 20.0 * (best > 0.5)[:, None]
         board.write("doors.conclusions", conclusions, "arbiter")
+
+    def verify_loop(self, board: Blackboard, sessions: list[dict], query: torch.Tensor, mode: str) -> None:
+        """Per question, in order: the arbiter's view without asking -> decide whether to ask the article part
+        -> the arbiter's conclusion from what was heard -> after the answer, remember what each channel said."""
+        views = self.channel_says(board, sessions)
+        says, truth, door = views["says"], views["truth"], views["door"]
+        batch, episodes = truth.shape
+        rows = torch.arange(len(query), device=self.device)
+        features = self.router_features(board.read("thinker.first"), query)[rows, door].view(batch, episodes, 3)
+        memory = self.arbiter.initial_memory(batch)
+        logits_out, asked_out, features_out = [], [], []
+        for t in range(episodes):
+            said = says[:, t]
+            board_only = said.clone()
+            board_only[:, 1] = 0
+            without, withit = self.arbiter.step(board_only, memory), self.arbiter.step(said, memory)
+            f = features[:, t].clone()
+            f[:, 1] = without.softmax(-1)[:, :3].amax(-1)  # how sure MK1 is of the door without asking
+            features_out.append(f)
+            if mode == "never":
+                ask = torch.zeros(batch, dtype=torch.bool, device=self.device)
+            elif mode == "always":
+                ask = torch.ones(batch, dtype=torch.bool, device=self.device)
+            elif mode == "router":
+                ask = (self.verifier if self.verifier is not None else self.router)(f) > COST
+            else:  # hindsight: ask when it helps by more than its cost (needs the answer)
+                ask = door_score(withit, truth[:, t]) - door_score(without, truth[:, t]) > COST
+            logits_out.append(torch.where(ask[:, None], withit, without))
+            asked_out.append(ask)
+            memory = self.arbiter.update(memory, torch.where(ask[:, None, None], said, board_only), truth[:, t])
+        logits = torch.stack(logits_out, 1).flatten(0, 1)
+        board.write("arbiter.logits", logits, "arbiter")
+        board.write("verify.features", torch.stack(features_out, 1).flatten(0, 1), "router")
+        p = logits.softmax(-1)[:, :3]
+        best, pick = p.max(-1)
+        conclusions = torch.zeros(len(p), 3, 3, device=self.device)
+        conclusions[rows, door] = nn.functional.one_hot(pick, 3).float() * 20.0 * (best > 0.5)[:, None]
+        board.write("doors.conclusions", conclusions, "arbiter")
+        asked = torch.zeros(len(p), 3, dtype=torch.bool, device=self.device)
+        asked[rows, door] = torch.stack(asked_out, 1).flatten()
+        board.write("router.asked", asked, "router")
 
     @torch.no_grad()
     def channel_views(self, sessions: list[dict], chunk: int = 100) -> dict:
