@@ -1,0 +1,24 @@
+# environments
+/venv/
+/.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# large or downloaded: models, datasets, checkpoints, caches, results, logs
+/model/
+/data/
+/artifacts/
+*.log
+
+# notebooks
+.ipynb_checkpoints/
+
+# personal notes and local explainers
+/.eli5/
+
+# editors and OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

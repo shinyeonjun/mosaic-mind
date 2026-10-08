@@ -1,0 +1,61 @@
+# mosaic-mind
+
+거대한 언어모델 하나 대신, **역할별 부품(읽기, 신뢰, 질문, 생각, 연결, 사령탑, 성장)을 키워서 얼리고, 부품 사이의 작은 연결만 배워서 조합하는** 지능 모델을 노트북 한 대(RTX 5070 Laptop 8GB)로 키워 가는 연구다. 단계마다 질문 하나, 비교 대상, 판정 기준을 결과 보기 전에 `design/`에 적고, 실패와 정정도 그대로 기록한다.
+
+| 단계 | 할 수 있게 된 것 | 새 부품 | 결과 |
+|---|---|---|---|
+| 1 | 말투 속 신뢰 단서를 스스로 꺼내 씀 | 연결 머리 (6천) | 졸업 |
+| 2 | 언제, 누구에게 물을지 정함 | 호기심 머리 (1만) | 졸업 |
+| 3 | 3칸 고리만 배우고 6칸 고리를 더 오래 생각해서 풂 | 생각 루프 | 졸업 |
+| 4 | 얼린 부품 둘을 연결 184개로 이어 새 문제를 풂 | 연결 장치 | 졸업 |
+| 5 | 실제 한국어 기사(KLUE-MRC): 0.28B 전문가가 1.2B 범용 모델을 이김 | 읽기 전문가 | 절반 |
+| 6 | 실제 기사 + 거짓말하는 출처: 읽기와 신뢰를 함께 써서 루머를 거름 | 실제 글 신뢰 부품 | 졸업 |
+| 7 | "뭐가 모자라지?"를 보고 필요한 부품을 부름 | 사령탑 | 졸업 |
+| 8 | 실패가 늘 때만 새 부품을 키움 | "다음 차례" 가지 | 졸업 |
+| 9 | 새 능력의 모양을 가설로 찾음 | 가설 탐색 | 진행 중 |
+
+전체 그림과 결론은 `notebook/00_research_overview.ipynb`, 단계별 결과는 `notebook/06–13`, 연구 기록은 `design/research-log-2026-10-06.md`에 있다.
+
+## 처음 실험들 (Local Cognitive Lab)
+
+역할별 부품(언어 해석, 기억, 판단)을 연결해서 판단하고 공부하는 시스템을 작은 통제 실험으로 만들고 측정한다. 초기 실험(001–010)은 정답 구조 관측으로 순환 코어를 비교했다. 규칙 세계 v1/v2부터는 한국어 문장 입력과 사전학습 모델 부품을 쓴다.
+
+## 실행
+
+프로젝트 venv가 이미 있다면:
+
+```powershell
+uv pip install --python .\venv\Scripts\python.exe --index-url https://download.pytorch.org/whl/cu130 --extra-index-url https://pypi.org/simple --index-strategy unsafe-best-match -e . "torch==2.14.1+cu130"
+& .\venv\Scripts\python.exe -m cognitive_lab.selfcheck
+& .\venv\Scripts\python.exe -m cognitive_lab.train --device auto
+```
+
+RTX 50 시리즈용 CUDA 13.0 휠을 사용한다. `unsafe-best-match`는 이 설치 명령에서 정확히 지정한 PyTorch CUDA 휠을 PyPI의 CPU 휠보다 선택하기 위해 넣었다. 결과 JSON과 체크포인트는 각각 `artifacts/results/`, `artifacts/checkpoints/`에 생긴다. GPU 자동 선택은 PyTorch에서 CUDA를 사용할 수 있을 때만 적용된다.
+
+기본 학습 명령은 GRU 상태 크기 기준선, GRU 파라미터 수 기준선, RIMs형 코어를 한 seed에서 비교한다. 여러 seed는 CMD에서 다음처럼 연속 실행할 수 있다. 각 seed 결과는 별도 JSON으로 저장된다.
+
+```cmd
+for %S in (43 44 45 46 47) do python -m cognitive_lab.train --device cuda --seed %S
+```
+
+## 구조
+
+- `design/`: 가설과 실험 정의
+- `model/`: 내려받은 사전학습 모델. LFM2.5-1.2B와 mDeBERTa NLI를 규칙 세계 실험에서 쓴다.
+- `src/cognitive_lab/task.py`, `core/`, `train.py`: 실험 001–005 (기억 갱신 과제, GRU/RIMs 비교)
+- `src/cognitive_lab/active/`: 실험 006–010 (질문을 고르는 탐구형 에이전트)
+- `src/cognitive_lab/world/`: 규칙 세계 v1. 한국어 문장 → 판단. 생성기, 정답 해결기, 지름길 검사, 점수판, L1/P1/P2 에이전트가 있다. 설계: `design/world-v1-korean-rule-world.md`
+- `src/cognitive_lab/world2/`: 규칙 세계 v2. 누구를 믿을지 경험으로 배운다. 신탁, 코드 학습자(B2/B3), 신경망 판단기(N2), 분석 도구가 있다. 설계: `design/world-v2-learning-to-judge.md`
+  - `hedged*.py`: 말투 세계와 연결 머리(1단계), `asking*.py`: 물어보기와 호기심 머리(2단계)
+- `src/cognitive_lab/world3/`: 이어진 단서와 생각 루프(3단계). 설계: `design/world-v3-thinking.md`
+- `src/cognitive_lab/world4/`: 신뢰 + 생각 복합 문제, 부품 연결(4단계). 설계: `design/world-v4-composite.md`
+- `src/cognitive_lab/world5/`: KLUE-MRC, 범용 언어모델 vs 읽기 전문가(5단계). 설계: `design/world-v5-real-korean.md`
+- `src/cognitive_lab/world6/`: 실제 기사 + 출처 신뢰(6단계). 설계: `design/world-v6-real-trust.md`
+- `src/cognitive_lab/world7/`: 사령탑(7단계). 설계: `design/world-v7-routing.md`
+- `src/cognitive_lab/world8/`: 스스로 성장과 모양 찾기(8–9단계). 설계: `design/world-v8-growth.md`
+- `data/`(git 제외): KLUE-MRC parquet. `huggingface_hub`로 `klue/klue`의 `mrc/` 두 파일을 `data/klue-mrc/`에 받는다.
+- `model/`, `artifacts/`(git 제외): 내려받은 모델, 체크포인트, 결과 JSON, 캐시
+- `notebook/`: 결과 분석과 그래프 전용 노트북. 재사용할 로직은 `src`에 둔다.
+
+규칙 세계 실험은 `transformers`가 필요하고(`pip install -e .[llm]`), 노트북은 `jupyter`와 `matplotlib`이 필요하다.
+
