@@ -45,7 +45,7 @@ def load(path=CACHE) -> dict[str, dict]:
 
 def main() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    reader = Reader(device)
+    reader = Reader(device, precise=False)  # the cache was read in bf16; keep appending the same way
     done = load() if CACHE.exists() else {}
     earlier = load(OLD_CACHE) if OLD_CACHE.exists() else {}  # reuse planted answers and true reports
     with CACHE.open("a", encoding="utf-8") as out:

@@ -212,12 +212,15 @@ if __name__ == "__main__":
 
 
 class Reader:
-    """The trained reading specialist for single passages (rule world v6 uses it on report versions)."""
+    """The trained reading specialist for single passages (rule world v6 uses it on report versions).
 
-    def __init__(self, device: torch.device):
+    Reads in fp32 by default (MK1): in bf16 an answer could change with what else was in the batch
+    (10 of 300 test answers did). `precise=False` is the bf16 reading the v5/v6 caches were made with."""
+
+    def __init__(self, device: torch.device, precise: bool = True):
         from transformers import AutoTokenizer
 
-        self.device = device
+        self.device, self.precise = device, precise
         self.tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_DIR)
         self.model = load_model(device, trained=True).eval()
 
@@ -227,7 +230,8 @@ class Reader:
         enc = encode(self.tokenizer, [question], [context])
         ids = torch.tensor(enc["input_ids"]).to(self.device)
         mask = torch.tensor(enc["attention_mask"]).to(self.device)
-        with torch.autocast(device_type=self.device.type, dtype=torch.bfloat16, enabled=self.device.type == "cuda"):
+        with torch.autocast(device_type=self.device.type, dtype=torch.bfloat16,
+                            enabled=self.device.type == "cuda" and not self.precise):
             output = self.model(input_ids=ids, attention_mask=mask)
         starts, ends = output.start_logits.float().cpu(), output.end_logits.float().cpu()
         found, null = [], -1e9

@@ -2,9 +2,12 @@
 
 Run after any change to code a part depends on; every score must match its part card in
 `mk1/registry.py` (tolerance 0.002). A missing part is reported, not skipped silently.
+The board checks ("board:" names) re-measure stages 1, 3, 4 and 7 with one MK1 whose parts talk only
+through the blackboard and read live (mk1/system.py): wiring must not change any score.
 
 python -m cognitive_lab.mk1.checks            # all
 python -m cognitive_lab.mk1.checks stage3     # names containing "stage3"
+python -m cognitive_lab.mk1.checks board      # the board checks only
 """
 
 import sys
@@ -75,11 +78,11 @@ def stage4_composite(device):
 
 
 def stage5_reader(device):
-    """200 test questions are re-read live; at least 95% must give the cached answer. The reader runs in
-    bf16, whose results shift with batch composition: the cached predictions were read 32 questions at a
-    time, the check reads one at a time, and 10 of 300 answers differed (153 vs 154 right). The score is
-    the share of answerable test questions the cached reading gets right. (To do in MK1 stage B: read in
-    fp32 so answers do not depend on batching.)"""
+    """200 test questions are re-read live; at least 95% must give the cached answer. The cache was read
+    in bf16, 32 questions at a time, and bf16 answers shift with batch composition (read one at a time,
+    10 of 300 differed). Live reading is now fp32 (MK1 stage B), which does not depend on batching, so the
+    remaining differences are the cache's bf16 rounding. The score is the share of answerable test
+    questions the cached reading gets right (the graduation record)."""
     from cognitive_lab.world5 import klue
     from cognitive_lab.world5.reader_qa import Reader, load_predictions
 
@@ -133,6 +136,62 @@ def reader_parity(device):
     return max(report["stage 1-2 (v2-H reader table)"], report["stage 3-4 (v3 thinker table)"])
 
 
+_MK1 = {}
+
+
+def mk1(device):
+    from cognitive_lab.mk1.system import MK1
+
+    if device not in _MK1:
+        _MK1[device] = MK1(device)
+    return _MK1[device]
+
+
+def board_stage1(device):
+    from cognitive_lab.mk1.system import composite_sessions
+    from cognitive_lab.world2.integrated import calibrated_score
+    from cognitive_lab.world4 import composite
+
+    sessions = composite_sessions(composite.generate_part("test", 42))  # the v2-H test sessions, chains added
+    out, _ = mk1(device)(sessions, "trust")
+    shape = (len(sessions), -1)
+    return calibrated_score(out["logits"].view(*shape, 3), out["targets"].view(shape))
+
+
+def board_stage3(device):
+    from cognitive_lab.mk1.system import chain_sessions
+    from cognitive_lab.world3 import chains
+    from cognitive_lab.world3.thinker import scores
+
+    out, _ = mk1(device)(chain_sessions(chains.generate("test", 45)), "think")
+    return round(scores(out["logits"], out["targets"]).mean().item(), 4)
+
+
+def board_stage4(device):
+    from cognitive_lab.mk1.system import composite_sessions
+    from cognitive_lab.world3.thinker import scores
+    from cognitive_lab.world4 import composite
+
+    out, _ = mk1(device)(composite_sessions(composite.generate_part("test", 42 + 200)), "ask-all")
+    return round(scores(out["logits"], out["targets"]).mean().item(), 4)
+
+
+def board_stage7(device):
+    from cognitive_lab.mk1.system import composite_sessions
+    from cognitive_lab.world3.thinker import scores
+    from cognitive_lab.world7.routing import COST, generate
+
+    raw = generate("test", 42)
+    out, board = mk1(device)(composite_sessions(raw), "route")
+    net = scores(out["logits"], out["targets"]) - COST * out["asks"]
+    tc = torch.tensor([e["composite"]["type"] == "TC" for s in raw for e in s["episodes"]], device=net.device)
+    return round(net[tc].mean().item(), 4)
+
+
+BOARD_CHECKS = {"stage1-trust": board_stage1, "stage3-thinker": board_stage3, "stage4-composite": board_stage4,
+                "stage7-router": board_stage7}
+
+
 CHECKS = {"reader-parity": reader_parity, "stage1-trust": stage1_trust, "stage2-curiosity": stage2_curiosity,
           "stage3-thinker": stage3_thinker, "stage4-composite": stage4_composite, "stage5-reader": stage5_reader,
           "stage6-trust-real": stage6_trust_real, "stage7-router": stage7_router}
@@ -159,6 +218,20 @@ def main() -> int:
         failures += not ok
         print(f"{'PASS' if ok else 'FAIL':8s} {name:20s} expected {expected:.4f} got {got:.4f} "
               f"({time.perf_counter() - started:.0f}s)  {part.role}", flush=True)
+    for part in PARTS:
+        name, expected = part.graduation.get("check"), part.graduation.get("score")
+        if name not in BOARD_CHECKS or wanted and not any(w in "board:" + name for w in wanted):
+            continue
+        started = time.perf_counter()
+        try:
+            got = float(BOARD_CHECKS[name](device))
+            ok = abs(got - expected) <= TOLERANCE
+        except Exception as error:  # report and keep going
+            got, ok = float("nan"), False
+            print(f"ERROR    board:{name}: {error!r}")
+        failures += not ok
+        print(f"{'PASS' if ok else 'FAIL':8s} {'board:' + name:20s} expected {expected:.4f} got {got:.4f} "
+              f"({time.perf_counter() - started:.0f}s)  MK1 on the board", flush=True)
     print("all passed" if failures == 0 else f"{failures} failed")
     return failures
 

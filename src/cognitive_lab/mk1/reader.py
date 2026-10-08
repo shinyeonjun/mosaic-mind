@@ -3,7 +3,8 @@
 Every grown part reads through the same frozen reader (rule-world v1, staged-tuned, seed 42): the
 pooled 768-d feature of (sentence, hypothesis), computed in fp32 (bf16 shifted cached values by up
 to 0.19 depending on batch composition; see design/research-log-2026-10-06.md, pitfalls). Results
-are memoised, so a sentence is read once per hypothesis.
+are memoised, so a sentence is read once per hypothesis; with `store`, the memo is kept on disk
+between runs (a reading memory: the same frozen reader in fp32, so a remembered reading equals a live one).
 
 python -m cognitive_lab.mk1.reader      # parity with the precomputed tables
 """
@@ -12,13 +13,19 @@ import random
 
 import torch
 
-from cognitive_lab.world2.integrated import CHECKPOINT_DIR, DEFAULT_READER
+from cognitive_lab.world2.integrated import CACHE_DIR, CHECKPOINT_DIR, DEFAULT_READER
+
+READING_MEMORY = CACHE_DIR / "mk1-reading-memory.pt"
 
 
 class ReaderService:
-    def __init__(self, device: torch.device, reader_file: str = DEFAULT_READER, batch: int = 256):
-        self.device, self.reader_file, self.batch = device, reader_file, batch
+    def __init__(self, device: torch.device, reader_file: str = DEFAULT_READER, batch: int = 256, store=None):
+        self.device, self.reader_file, self.batch, self.store = device, reader_file, batch, store
         self.memo: dict[tuple[str, str], torch.Tensor] = {}
+        if store is not None and store.exists():
+            saved = torch.load(store)
+            if saved["reader"] == reader_file:
+                self.memo = dict(zip(saved["pairs"], saved["features"]))
         self._encoder = None
         self.calls = 0
 
@@ -50,6 +57,13 @@ class ReaderService:
                 for pair, row in zip(chunk, self._pooled["x"].float().cpu()):
                     self.memo[pair] = row
         return torch.stack([self.memo[p] for p in pairs])
+
+    def save(self) -> None:
+        """Write the reading memory to `store` if anything new was read."""
+        if self.store is not None and self.calls:
+            torch.save({"reader": self.reader_file, "pairs": list(self.memo),
+                        "features": torch.stack(list(self.memo.values()))}, self.store)
+            self.calls = 0
 
     def table(self, sentences: list[str], hypotheses: list[str]) -> torch.Tensor:
         """[S, H, 768] for every sentence against every hypothesis."""
