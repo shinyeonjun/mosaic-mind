@@ -161,7 +161,11 @@ def run(policy: str, blocks, seed: int, device: torch.device) -> dict:
             print(f"  {policy}: grew at block {decided_at} -> shape {growth['chosen']} ({growth['seconds']}s)", flush=True)
             studying, buffer = False, []
         log.append(entry)
-    return {"blocks": log, "growths": growths}
+    # Keep the grown branches (shape + weights), so the grown thinker can be re-measured and reused.
+    path = CHECKPOINT_DIR / f"world-v9_branches_{policy}_seed-{seed}.pt"
+    torch.save({"thinker_seed": seed, "branches": [{"shape": b.shape.argmax(1).tolist(), "state": b.state_dict()}
+                                                   for b in model.branches]}, path)
+    return {"blocks": log, "growths": growths, "branches_checkpoint": path.name}
 
 
 def main() -> None:

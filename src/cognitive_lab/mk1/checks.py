@@ -1,0 +1,167 @@
+"""Graduation checks: re-measure each stage's graduation score from the saved parts, without training.
+
+Run after any change to code a part depends on; every score must match its part card in
+`mk1/registry.py` (tolerance 0.002). A missing part is reported, not skipped silently.
+
+python -m cognitive_lab.mk1.checks            # all
+python -m cognitive_lab.mk1.checks stage3     # names containing "stage3"
+"""
+
+import sys
+import time
+
+import torch
+
+from cognitive_lab.mk1.registry import PARTS
+
+TOLERANCE = 0.002
+
+
+def stage1_trust(device):
+    from cognitive_lab.world2 import hedged
+    from cognitive_lab.world2.hedged_system import ConnectedSystem, checkpoint_path, feature_table, session_index
+    from cognitive_lab.world2.integrated import calibrated_score
+
+    saved = torch.load(checkpoint_path(42, 8), map_location="cpu")
+    rows, features, head = feature_table(saved["reader"], device)
+    model = ConnectedSystem(features, head, saved["message_size"]).to(device)
+    model.load_state_dict(saved["state"])
+    model.eval()
+    test = tuple(t.to(device) for t in session_index(hedged.generate_part("test", 42), rows))
+    with torch.no_grad():
+        return calibrated_score(model(*test), test[2])
+
+
+def stage2_curiosity(device):
+    from cognitive_lab.world2 import hedged
+    from cognitive_lab.world2.asking_system import CuriosityHead, load_stage1, run_policy, tensors
+    from cognitive_lab.world2.integrated import CHECKPOINT_DIR
+
+    system, rows = load_stage1(42, device)
+    with torch.no_grad():
+        table = system.messages()
+    base, answers = tensors(hedged.generate_part("test", 42), rows, device)
+    head = CuriosityHead().to(device)
+    head.load_state_dict(torch.load(CHECKPOINT_DIR / "world-v2a_curiosity_cost-0.2_seed-42.pt")["state"])
+    head.eval()
+    return run_policy(system, table, base, answers, "curiosity", head, 0.2, seed=42)["net"]
+
+
+def stage3_thinker(device):
+    from cognitive_lab.world2.integrated import CHECKPOINT_DIR
+    from cognitive_lab.world3 import chains
+    from cognitive_lab.world3.features import feature_table
+    from cognitive_lab.world3.thinker import Thinker, episode_tensors, evaluate
+
+    table = feature_table(device)
+    model = Thinker(table["features"].to(device), message="state").to(device)
+    model.load_state_dict(torch.load(CHECKPOINT_DIR / "world-v3_thinker-grown_seed-45.pt")["state"])
+    model.eval()
+    data = tuple(t.to(device) for t in episode_tensors(chains.generate("test", 45), table))
+    return evaluate(model, data, 16)["adaptive"]
+
+
+def stage4_composite(device):
+    from cognitive_lab.world4 import composite
+    from cognitive_lab.world4.system import CHECKPOINT_DIR, CompositeSystem, evaluate, load_parts, session_tensors
+
+    trust, thinker, rows, chain_table = load_parts(42, "grown", device)
+    model = CompositeSystem(trust, thinker).to(device)
+    model.load_state_dict(torch.load(CHECKPOINT_DIR / "world-v4_grown_seed-42.pt")["state"])
+    model.eval()
+    sessions = composite.generate_part("test", 42 + 200)
+    data = {k: v.to(device) for k, v in session_tensors(sessions, rows, chain_table).items()}
+    return evaluate(model, data)["score"]
+
+
+def stage5_reader(device):
+    """200 test questions are re-read live; at least 95% must give the cached answer. The reader runs in
+    bf16, whose results shift with batch composition: the cached predictions were read 32 questions at a
+    time, the check reads one at a time, and 10 of 300 answers differed (153 vs 154 right). The score is
+    the share of answerable test questions the cached reading gets right. (To do in MK1 stage B: read in
+    fp32 so answers do not depend on batching.)"""
+    from cognitive_lab.world5 import klue
+    from cognitive_lab.world5.reader_qa import Reader, load_predictions
+
+    cached = load_predictions()
+    questions = klue.load("test")
+    reader = Reader(device)
+    same = sum(reader.read(q["question"], q["context"])["answer"] == cached[q["guid"]]["answer"] for q in questions[:200])
+    if same < 0.95 * 200:
+        raise AssertionError(f"only {same}/200 live answers match the cached predictions")
+    answerable = [q for q in questions if not q["impossible"]]
+    return round(sum(klue.is_right(cached[q["guid"]]["answer"], q["answers"]) for q in answerable) / len(answerable), 4)
+
+
+def stage6_trust_real(device):
+    from cognitive_lab.world6 import world
+    from cognitive_lab.world6.trust import CHECKPOINT_DIR, TrustPart, choices, episode_scores, tensors
+
+    data = {k: v.to(device) for k, v in tensors(world.generate("test", 42)).items()}
+    model = TrustPart().to(device)
+    model.load_state_dict(torch.load(CHECKPOINT_DIR / "world-v6_trust_seed-42.pt")["state"])
+    model.eval()
+    with torch.no_grad():
+        return round(episode_scores(choices(model(data)), data).mean().item(), 4)
+
+
+def stage7_router(device):
+    from cognitive_lab.world4.system import CHECKPOINT_DIR, CompositeSystem, load_parts, session_tensors
+    from cognitive_lab.world7.routing import COST, TYPES, Router, generate, run_all_subsets, subset_index
+
+    trust, thinker, rows, chain_table = load_parts(42, "grown", device)
+    model = CompositeSystem(trust, thinker).to(device)
+    model.load_state_dict(torch.load(CHECKPOINT_DIR / "world-v4_grown_seed-42.pt")["state"])
+    model.eval()
+    sessions = generate("test", 42)
+    data = {k: v.to(device) for k, v in session_tensors(sessions, rows, chain_table).items()}
+    data["types"] = torch.tensor([[TYPES.index(e["composite"]["type"]) for e in s["episodes"]] for s in sessions], device=device)
+    run = run_all_subsets(model, data)
+    router = Router().to(device)
+    router.load_state_dict(torch.load(CHECKPOINT_DIR / "world-v7_router_seed-42.pt")["router"])
+    router.eval()
+    with torch.no_grad():
+        asked = router(run["features"]) > COST
+    scores = run["subset_scores"].gather(1, subset_index(asked)[:, None]).squeeze(1)
+    return round(scores[run["types"] == TYPES.index("TC")].mean().item(), 4)
+
+
+def reader_parity(device):
+    from cognitive_lab.mk1.reader import parity
+
+    report = parity(device, samples=1000)
+    return max(report["stage 1-2 (v2-H reader table)"], report["stage 3-4 (v3 thinker table)"])
+
+
+CHECKS = {"reader-parity": reader_parity, "stage1-trust": stage1_trust, "stage2-curiosity": stage2_curiosity,
+          "stage3-thinker": stage3_thinker, "stage4-composite": stage4_composite, "stage5-reader": stage5_reader,
+          "stage6-trust-real": stage6_trust_real, "stage7-router": stage7_router}
+
+
+def main() -> int:
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    wanted = sys.argv[1:]
+    failures = 0
+    for part in PARTS:
+        name, expected = part.graduation.get("check"), part.graduation.get("score")
+        if wanted and not any(w in name for w in wanted):
+            continue
+        if expected is None or name not in CHECKS:
+            print(f"MISSING  {name:20s} {part.role}: no saved part to re-measure")
+            continue
+        started = time.perf_counter()
+        try:
+            got = float(CHECKS[name](device))
+            ok = abs(got - expected) <= TOLERANCE
+        except Exception as error:  # report and keep going
+            got, ok = float("nan"), False
+            print(f"ERROR    {name}: {error}")
+        failures += not ok
+        print(f"{'PASS' if ok else 'FAIL':8s} {name:20s} expected {expected:.4f} got {got:.4f} "
+              f"({time.perf_counter() - started:.0f}s)  {part.role}", flush=True)
+    print("all passed" if failures == 0 else f"{failures} failed")
+    return failures
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
