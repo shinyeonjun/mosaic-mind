@@ -2,7 +2,7 @@
 
 Run after any change to code a part depends on; every score must match its part card in
 `mk1/registry.py` (tolerance 0.002). A missing part is reported, not skipped silently.
-The board checks ("board:" names) re-measure stages 1, 3, 4 and 7 with one MK1 whose parts talk only
+The board checks ("board:" names) re-measure stages 1-4 and 7 with one MK1 whose parts talk only
 through the blackboard and read live (mk1/system.py): wiring must not change any score.
 
 python -m cognitive_lab.mk1.checks            # all
@@ -158,6 +158,16 @@ def board_stage1(device):
     return calibrated_score(out["logits"].view(*shape, 3), out["targets"].view(shape))
 
 
+def board_stage2(device):
+    from cognitive_lab.mk1.system import speaker_sessions
+    from cognitive_lab.world2 import hedged
+    from cognitive_lab.world2.asking_system import COST
+    from cognitive_lab.world3.thinker import scores
+
+    out, _ = mk1(device)(speaker_sessions(hedged.generate_part("test", 42)), "trust", curious=True)
+    return round((scores(out["logits"], out["targets"]) - COST * out["speaker_asks"]).mean().item(), 4)
+
+
 def board_stage3(device):
     from cognitive_lab.mk1.system import chain_sessions
     from cognitive_lab.world3 import chains
@@ -188,7 +198,7 @@ def board_stage7(device):
     return round(net[tc].mean().item(), 4)
 
 
-BOARD_CHECKS = {"stage1-trust": board_stage1, "stage3-thinker": board_stage3, "stage4-composite": board_stage4,
+BOARD_CHECKS = {"stage1-trust": board_stage1, "stage2-curiosity": board_stage2, "stage3-thinker": board_stage3, "stage4-composite": board_stage4,
                 "stage7-router": board_stage7}
 
 

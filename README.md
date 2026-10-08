@@ -13,6 +13,7 @@
 | 7 | "뭐가 모자라지?"를 보고 필요한 부품을 부름 | 사령탑 | 졸업 |
 | 8 | 실패가 늘 때만 새 부품을 키움 | "다음 차례" 가지 | 졸업 |
 | 9 | 새 능력의 모양을 가설로 찾음 (한 칸 돌리기, 해↔별) | 가설 탐색 | 졸업 |
+| MK1 | 부품들을 칠판으로 묶어 하나로: 섞인 문제를 종류도 모른 채 풂, 점수 그대로 + 물어보기 +0.12 | 칠판, 읽기 기억 | 졸업 (A–C) |
 
 전체 그림과 결론은 `notebook/00_research_overview.ipynb`, 단계별 결과는 `notebook/06–14`, 연구 기록은 `design/research-log-2026-10-06.md`에 있다.
 
@@ -53,6 +54,7 @@ for %S in (43 44 45 46 47) do python -m cognitive_lab.train --device cuda --seed
 - `src/cognitive_lab/world6/`: 실제 기사 + 출처 신뢰(6단계). 설계: `design/world-v6-real-trust.md`
 - `src/cognitive_lab/world7/`: 사령탑(7단계). 설계: `design/world-v7-routing.md`
 - `src/cognitive_lab/world8/`: 스스로 성장과 모양 찾기(8–9단계). 설계: `design/world-v8-growth.md`
+- `src/cognitive_lab/mk1/`: MK1 통합(부품 명함, 졸업 시험, 칠판, 통합 시험). 설계: `design/mk1-integration.md`
 - `data/`(git 제외): KLUE-MRC parquet. `huggingface_hub`로 `klue/klue`의 `mrc/` 두 파일을 `data/klue-mrc/`에 받는다.
 - `model/`, `artifacts/`(git 제외): 내려받은 모델, 체크포인트, 결과 JSON, 캐시
 - `notebook/`: 결과 분석과 그래프 전용 노트북. 재사용할 로직은 `src`에 둔다.
