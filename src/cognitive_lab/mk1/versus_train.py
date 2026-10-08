@@ -85,7 +85,8 @@ def main() -> None:
     tokenizer, net = model.tokenizer, model.model
     trainable = apply_lora(net, args.rank, args.alpha, 0.05)
     net.to(device)
-    net.gradient_checkpointing_enable() if hasattr(net, "gradient_checkpointing_enable") else None
+    net.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})  # 2-5k-token prompts fit in 8GB
+    net.config.use_cache = False
     optimizer = torch.optim.AdamW([p for p in net.parameters() if p.requires_grad], lr=args.learning_rate, weight_decay=0.0)
     encoded = []
     for _, messages, target, _, _ in train:

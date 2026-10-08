@@ -146,7 +146,8 @@ class LanguageModel:
     def generate(self, messages: list[dict], raw: bool = False) -> str:
         encoded = self.tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=True,
                                                      return_dict=True, return_tensors="pt").to(self.device)
-        output = self.model.generate(**encoded, do_sample=False, max_new_tokens=24, pad_token_id=self.tokenizer.pad_token_id)
+        output = self.model.generate(**encoded, do_sample=False, max_new_tokens=24, pad_token_id=self.tokenizer.pad_token_id,
+                                     use_cache=True)  # training turns the config cache off for checkpointing
         self.tokens += output.shape[1]
         text = self.tokenizer.decode(output[0, encoded["input_ids"].shape[1]:], skip_special_tokens=True).strip()
         if raw:
