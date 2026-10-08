@@ -45,7 +45,7 @@ not from the precomputed tables they were trained with (those are never loaded h
 import torch
 from torch import nn
 
-from cognitive_lab.mk1.arbiter import Arbiter
+from cognitive_lab.mk1.arbiter import Arbiter, CountingArbiter
 from cognitive_lab.mk1.arbiter import door_scores as door_score
 from cognitive_lab.mk1.articles import ArticleReading, trust_inputs
 from cognitive_lab.mk1.board import Blackboard
@@ -112,7 +112,8 @@ def chain_sessions(episodes: list[dict]) -> list[dict]:
 
 class MK1(nn.Module):
     def __init__(self, device: torch.device, seed: int = 42, store=READING_MEMORY, reading: str = "relevant",
-                 precision: str = "fp32", articles_from_cache: bool = False, article_precision: str = "fp32"):
+                 precision: str = "fp32", articles_from_cache: bool = False, article_precision: str = "fp32",
+                 arbiter: str = "learned"):
         super().__init__()
         self.device, self.reading = device, reading
         self.reader = ReaderService(device, store=store, precision=precision)
@@ -139,8 +140,10 @@ class MK1(nn.Module):
         self.verifier = None  # stage G: a router retrained for verifying, if one is loaded
         self.memory = None  # stage H: a LongTermMemory (mk1/memory.py), if one is attached
         self.recalls: list[bool] = []  # per article question answered: did the memory answer it
-        self.arbiter = Arbiter()
-        arbiter_file = CHECKPOINT_DIR / f"mk1-arbiter_seed-{seed}.pt"
+        # "learned" (stage F, GRU memory) or "counting" (stage I: counts + a fitted Beta prior)
+        self.arbiter = Arbiter() if arbiter == "learned" else CountingArbiter(learn_prior=True)
+        arbiter_file = CHECKPOINT_DIR / (f"mk1-arbiter_seed-{seed}.pt" if arbiter == "learned"
+                                         else f"mk1-arbiter-counting_seed-{seed}.pt")
         if arbiter_file.exists():
             self.arbiter.load_state_dict(torch.load(arbiter_file, map_location="cpu")["state"])
         self.to(device).eval()

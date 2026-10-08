@@ -7,7 +7,8 @@ channel was right, and weighs what each channel says by its memory. Weights are 
 channels (no channel names), so it can only learn "trust whoever has been right this session".
 Output: logits over the 3 keys and 모름; answer a key when its probability passes 0.5.
 
-python -m cognitive_lab.mk1.arbiter --seed 42      # train (article readings from the v6 cache)
+python -m cognitive_lab.mk1.arbiter --seed 42                   # train (article readings from the v6 cache)
+python -m cognitive_lab.mk1.arbiter --seed 42 --kind counting   # stage I: fit only the counting arbiter's prior
 """
 
 import argparse
@@ -60,6 +61,56 @@ class Arbiter(nn.Module):
         return torch.stack(out, 1)
 
 
+class CountingArbiter(nn.Module):
+    """The same job without learned weights: per channel, count how often it spoke and was right this session;
+    its accuracy is the Beta(1,1) posterior mean (right + 1) / (spoke + 2), any value in (0, 1). A channel saying
+    key k makes k `a` times as likely and each other key (1 - a) / 2 times, so a channel right less often than
+    chance (a < 1/3) counts against what it says. Nothing here depends on which accuracies training showed:
+    the learned arbiter failed on a board right only 25% of the time (design/audit-2026-10-08.md, 8).
+    With `learn_prior`, the starting belief Beta(alpha, beta) (shared by all channels: no names) is fitted on
+    training sessions, so experience sets how much a new channel is trusted at first, while the counts can still
+    take it anywhere in (0, 1)."""
+
+    def __init__(self, learn_prior: bool = False):
+        super().__init__()
+        self.log_prior = nn.Parameter(torch.zeros(2), requires_grad=learn_prior)  # log alpha, log beta (1, 1)
+
+    def initial_memory(self, batch: int, channels: int = 2) -> torch.Tensor:
+        return torch.zeros(batch, channels, 2, device=self._device)  # [right, spoke]
+
+    @property
+    def _device(self):
+        return getattr(self, "device", torch.device("cpu"))
+
+    def to(self, *args, **kwargs):
+        device = next((a for a in args if isinstance(a, (torch.device, str))), kwargs.get("device"))
+        if device is not None:
+            self.device = torch.device(device)
+        return super().to(*args, **kwargs)
+
+    def step(self, said: torch.Tensor, memory: torch.Tensor) -> torch.Tensor:
+        alpha, beta = self.log_prior.exp()
+        accuracy = ((memory[..., 0] + alpha) / (memory[..., 1] + alpha + beta))[..., None]  # [B,C,1]
+        spoke = said.amax(-1, keepdim=True)  # [B,C,1]
+        keys = said.shape[-1]
+        likelihood = torch.where(said > 0, accuracy, (1 - accuracy) / (keys - 1))
+        log_p = torch.where(spoke > 0, likelihood.log(), torch.zeros_like(likelihood)).sum(1)  # [B,3]
+        return torch.cat([log_p, torch.full_like(log_p[:, :1], -1e4)], -1)  # never 모름 by itself: p > 0.5 decides
+
+    def update(self, memory: torch.Tensor, said: torch.Tensor, truth: torch.Tensor) -> torch.Tensor:
+        spoke = said.amax(-1)
+        right = said.gather(-1, truth[:, None, None].expand(-1, said.shape[1], 1)).squeeze(-1)
+        return memory + torch.stack([right, spoke], -1)
+
+    def forward(self, says: torch.Tensor, truth: torch.Tensor) -> torch.Tensor:
+        memory = self.initial_memory(says.shape[0], says.shape[2]).to(says.device)
+        out = []
+        for t in range(says.shape[1]):
+            out.append(self.step(says[:, t], memory))
+            memory = self.update(memory, says[:, t], truth[:, t])
+        return torch.stack(out, 1)
+
+
 def door_scores(logits: torch.Tensor, truth: torch.Tensor) -> torch.Tensor:
     """+1 right key, -1 wrong key, 0 모름 (the article door always has a key)."""
     p = logits.softmax(-1)[..., :3]
@@ -76,6 +127,7 @@ def main() -> None:
     parser.add_argument("--train-sessions", type=int, default=600)
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--tag", default="", help="checkpoint name suffix (revisions)")
+    parser.add_argument("--kind", choices=("learned", "counting"), default="learned")
     args = parser.parse_args()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     torch.manual_seed(args.seed)
@@ -86,6 +138,22 @@ def main() -> None:
         sessions = world.generate(part, seed, count, board_accuracies=BOARD_ACCURACIES)
         views[part] = {k: v.to(device) for k, v in model.channel_views(sessions).items()}
         print(f"{part}: {len(sessions)} sessions ({time.perf_counter() - started:.0f}s)", flush=True)
+    if args.kind == "counting":  # stage I: two numbers, the starting belief Beta(alpha, beta), fitted full-batch
+        arbiter = CountingArbiter(learn_prior=True).to(device)
+        optimizer = torch.optim.Adam(arbiter.parameters(), lr=0.05)
+        train = views["train"]
+        for _ in range(150):
+            loss = nn.functional.cross_entropy(arbiter(train["says"], train["truth"]).reshape(-1, 4), train["truth"].reshape(-1))
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+        alpha, beta = arbiter.log_prior.exp().tolist()
+        with torch.no_grad():
+            value = door_scores(arbiter(views["validation"]["says"], views["validation"]["truth"]), views["validation"]["truth"]).mean().item()
+        path = CHECKPOINT_DIR / f"mk1-arbiter-counting_seed-{args.seed}.pt"
+        torch.save({"state": arbiter.state_dict(), "alpha": alpha, "beta": beta}, path)
+        print(f"prior Beta({alpha:.2f}, {beta:.2f}), validation door score {value:.4f}; saved {path}")
+        return
     arbiter = Arbiter().to(device)
     optimizer = torch.optim.Adam(arbiter.parameters(), lr=3e-3)
     generator = torch.Generator().manual_seed(args.seed)
