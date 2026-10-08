@@ -26,6 +26,7 @@ from torch import nn
 
 from cognitive_lab.mk1.board import Blackboard
 from cognitive_lab.mk1.reader import READING_MEMORY, ReaderService
+from cognitive_lab.mk1.relevance import board_relevant, fillers
 from cognitive_lab.world2 import asking
 from cognitive_lab.world2.asking_system import COST as ASK_COST
 from cognitive_lab.world2.asking_system import CuriosityHead
@@ -83,10 +84,15 @@ def chain_sessions(episodes: list[dict]) -> list[dict]:
 
 
 class MK1(nn.Module):
-    def __init__(self, device: torch.device, seed: int = 42, store=READING_MEMORY):
+    def __init__(self, device: torch.device, seed: int = 42, store=READING_MEMORY, reading: str = "relevant",
+                 precision: str = "fp32"):
         super().__init__()
-        self.device = device
-        self.reader = ReaderService(device, store=store)
+        self.device, self.reading = device, reading
+        self.reader = ReaderService(device, store=store, precision=precision)
+        # "relevant": read board sentences only against the hypotheses that matter, fillers elsewhere
+        # (mk1/relevance.py: 37 of 102, scores unchanged);
+        # "full": read every hypothesis, as the parts were trained.
+        self.fillers = fillers(self.reader) if reading == "relevant" else None
         saved = torch.load(trust_checkpoint(seed, 8), map_location="cpu")
         empty_head = {"weight": torch.zeros(4, 768), "bias": torch.zeros(4)}
         trust = ConnectedSystem(torch.zeros(1, 768), empty_head, saved["message_size"])  # features come from the board
@@ -145,8 +151,15 @@ class MK1(nn.Module):
             for t, episode in enumerate(session["episodes"]):
                 if episode["board"]:
                     posted[b, t, :len(episode["board"])] = torch.tensor([lookup[x] for x in episode["board"]], dtype=torch.long)
-        features = (self.reader.table(sentences, THINKER_HYPOTHESES) if sentences
-                    else torch.zeros(0, len(THINKER_HYPOTHESES), 768))
+        if not sentences:
+            features = torch.zeros(0, len(THINKER_HYPOTHESES), 768)
+        elif self.fillers is None:
+            features = self.reader.table(sentences, THINKER_HYPOTHESES)
+        else:
+            features = self.fillers.expand(len(sentences), -1, -1).clone()
+            wanted = [(i, j) for i, x in enumerate(sentences) for j in board_relevant(x)]
+            rows = self.reader.features([(sentences[i], THINKER_HYPOTHESES[j]) for i, j in wanted])
+            features[[i for i, _ in wanted], [j for _, j in wanted]] = rows
         board.write("reading.board", {"features": features, "index": posted}, "reader")
 
     # --- trust part (+ curiosity): speakers + memory -> each base door's key -------------------------

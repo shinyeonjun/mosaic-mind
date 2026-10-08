@@ -19,11 +19,19 @@ READING_MEMORY = CACHE_DIR / "mk1-reading-memory.pt"
 
 
 class ReaderService:
-    def __init__(self, device: torch.device, reader_file: str = DEFAULT_READER, batch: int = 256, store=None):
-        self.device, self.reader_file, self.batch, self.store = device, reader_file, batch, store
+    """`precision`: "fp32" (default, what every part was trained on) or "fp16" (about 1.8x faster on the
+    laptop GPU, where fp32 reading is compute-bound at about 800 pairs/s; see design/mk1-integration.md).
+    Pairs are read sorted by length, so a batch carries little padding (fp32 results do not depend on it)."""
+
+    def __init__(self, device: torch.device, reader_file: str = DEFAULT_READER, batch: int = 256, store=None,
+                 precision: str = "fp32"):
+        if precision not in ("fp32", "fp16"):
+            raise ValueError(precision)
+        self.device, self.reader_file, self.batch, self.precision = device, reader_file, batch, precision
+        self.store = None if store is None else store.with_name(f"{store.stem}-{precision}{store.suffix}") if precision != "fp32" else store
         self.memo: dict[tuple[str, str], torch.Tensor] = {}
-        if store is not None and store.exists():
-            saved = torch.load(store)
+        if self.store is not None and self.store.exists():
+            saved = torch.load(self.store)
             if saved["reader"] == reader_file:
                 self.memo = dict(zip(saved["pairs"], saved["features"]))
         self._encoder = None
@@ -38,25 +46,32 @@ class ReaderService:
             encoder = PairEncoder(encoder_dir=ENCODER_DIRS[saved["encoder_name"]]).to(self.device)
             load_reader(encoder, saved["reader"])
             encoder.eval()
-            self._pooled = {}
-            encoder.head.register_forward_hook(lambda _m, inputs, _o: self._pooled.__setitem__("x", inputs[0]))
             self._encoder = encoder
             self.head = {k: v.detach().cpu().clone() for k, v in encoder.head.state_dict().items()}
         return self._encoder
 
     @torch.no_grad()
     def features(self, pairs: list[tuple[str, str]]) -> torch.Tensor:
-        """Pooled fp32 features [len(pairs), 768] on the CPU."""
-        missing = [p for p in dict.fromkeys(pairs) if p not in self.memo]
+        """Pooled features [len(pairs), 768] (fp32 tensors) on the CPU."""
+        missing = sorted((p for p in dict.fromkeys(pairs) if p not in self.memo), key=lambda p: len(p[0]) + len(p[1]))
         if missing:
             encoder = self._load()
             for start in range(0, len(missing), self.batch):
                 chunk = missing[start:start + self.batch]
-                encoder([s for s, _ in chunk], [h for _, h in chunk], precise=True)
                 self.calls += len(chunk)
-                for pair, row in zip(chunk, self._pooled["x"].float().cpu()):
+                for pair, row in zip(chunk, self._pool(encoder, chunk)):
                     self.memo[pair] = row
         return torch.stack([self.memo[p] for p in pairs])
+
+    def _pool(self, encoder, chunk: list[tuple[str, str]]) -> torch.Tensor:
+        """The reader's pooled input to its head (as PairEncoder.forward computes it)."""
+        batch = encoder.tokenizer([s for s, _ in chunk], [h for _, h in chunk], return_tensors="pt", padding=True,
+                                  truncation=True, max_length=64).to(self.device)
+        with torch.autocast(device_type=self.device.type, dtype=torch.float16,
+                            enabled=self.device.type == "cuda" and self.precision == "fp16"):
+            states = encoder.backbone(**batch).last_hidden_state
+        mask = batch["attention_mask"].unsqueeze(-1).float()
+        return ((states.float() * mask).sum(1) / mask.sum(1)).cpu()
 
     def save(self) -> None:
         """Write the reading memory to `store` if anything new was read."""
