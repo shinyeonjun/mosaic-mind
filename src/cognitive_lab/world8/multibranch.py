@@ -7,10 +7,14 @@ link per sentence: relation gate x pair attention), from frozen-reader features 
 against relation-neutral hypotheses ("b's key is fixed by a's"). The pair scorer starts on the
 reader's 4-d head row 0, which marks the mentioned pair for every relation (+1 vs -0.97); the
 relation gate starts neutral (it must learn which sentences are its relation: the 4-d head does not
-tell relations apart). A pair that is any branch's link is not a same link.
+tell relations apart). Each sentence has one owner (the branch with the largest relation logit,
+or none) and states one ordered pair (its owner's top attention), 0/1 forward and straight-through
+backward, so a new branch can win back sentences an old branch wrongly claimed without diluting the
+old branch's other links. A pair that is any branch's link is not a same link.
 
 Hypothesis search (the system finds the shape): a fresh branch is trained on the study material for
-each of the 6 shapes; the one with the best held-out score is kept (ties within 0.01: the shape that
+each of the 6 shapes, and, if a branch exists, "study the newest branch more" is a seventh hypothesis;
+the one with the best held-out score is kept (ties within 0.01: refining first, then the shape that
 moves fewer keys). Gradient descent from "pass unchanged" does not find the shape (probe: the matrix
 stayed near identity), so the shape is chosen by trying, not by sliding.
 """
@@ -49,16 +53,13 @@ class Branch(nn.Module):
             self.relation_score.weight.normal_(0, 0.01)
             self.relation_score.bias.zero_()
 
-    def links(self, features: torch.Tensor, pad: torch.Tensor, rows, cols) -> torch.Tensor:
-        """features [B,U,132,768] -> soft [B,D,D]: [b, i, j] = door j's key is door i's re-mapped."""
+    def parts(self, features: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """features [B,U,132,768] -> relation logit [B,U] ("this sentence is my relation") and
+        pair attention [B,U,132] (which ordered pair)."""
         messages = torch.tanh(self.head(features))
         attention = self.pair_score(messages).squeeze(-1).softmax(-1)
         summary = (attention[..., None] * messages).sum(2)
-        relation = torch.sigmoid(self.relation_score(summary)).squeeze(-1).masked_fill(pad, 0.0)
-        per_pair = (relation[..., None] * attention).amax(1)
-        out = per_pair.new_zeros(features.shape[0], DOOR_COUNT, DOOR_COUNT)
-        out[:, rows, cols] = per_pair
-        return out
+        return self.relation_score(summary).squeeze(-1), attention
 
 
 class MultiBranchThinker(Thinker):
@@ -90,11 +91,25 @@ class MultiBranchThinker(Thinker):
         if len(self.branches):
             safe = index.clamp(max=self.features.shape[0] - 1)
             features = self.relation_features[safe].float()
-            for branch in self.branches:
-                soft = branch.links(features, pad, self.rel_rows, self.rel_cols)
-                hard = soft if self.training else (soft > 0.5).float()
-                same = same * (1 - torch.maximum(hard, hard.transpose(1, 2)))
-                channels.append((hard.transpose(1, 2), hard, branch.shape))
+            parts = [branch.parts(features) for branch in self.branches]
+            # One sentence, one relation: shares are a softmax over "none" (logit 0) and every branch's
+            # relation logit; a link is on when share x attention > 0.5 (soft while training). When
+            # a new branch is trained, the older branches' relation gates are trained with it (their
+            # shapes, heads and pair attention stay frozen): learning a new relation redraws the
+            # borders of the old ones. Replay in the study material protects the old abilities.
+            # Earlier versions (see design/world-v8-growth.md, v9): frozen per-branch gates let an
+            # old branch claim sentences it had never seen (next took 56% of swap sentences); a
+            # frozen softmax diluted old links as soon as a new branch was added; a hard owner left
+            # a new branch nothing to learn from.
+            logits = torch.stack([torch.zeros_like(parts[0][0])] + [p[0] for p in parts], -1)
+            shares = logits.softmax(-1).masked_fill(pad[..., None], 0.0)
+            for n, (branch, (_, attention)) in enumerate(zip(self.branches, parts)):
+                per_pair = (shares[..., n + 1, None] * attention).amax(1)
+                soft = per_pair.new_zeros(batch, DOOR_COUNT, DOOR_COUNT)
+                soft[:, self.rel_rows, self.rel_cols] = per_pair
+                link = soft if self.training else (soft > 0.5).float()
+                same = same * (1 - torch.maximum(link, link.transpose(1, 2)))
+                channels.append((link.transpose(1, 2), link, branch.shape))
         width = z0.shape[-1]
         z = z0
         rows = torch.arange(batch, device=index.device)
@@ -121,17 +136,18 @@ class MultiBranchThinker(Thinker):
         return logits, halts
 
 
-def train_last_branch(model: MultiBranchThinker, data: tuple, validation: tuple, seed: int, epochs: int = 30,
+def train_last_branch(model: MultiBranchThinker, data: tuple, validation: tuple, seed: int, epochs: int = 40,
                       learning_rate: float = 2e-3, batch_size: int = 32) -> tuple[float, int]:
     """Train only the newest branch; keep its best epoch by validation score. Returns (score, epoch)."""
     torch.manual_seed(seed)
     branch = model.branches[-1]
-    params = list(branch.parameters())
+    params = list(branch.parameters()) + [p for old in model.branches[:-1] for p in old.relation_score.parameters()]
+    gates_before = [{k: v.clone() for k, v in old.relation_score.state_dict().items()} for old in model.branches[:-1]]
     optimizer = torch.optim.Adam(params, lr=learning_rate)
     index, query, target, _ = data
     model.eval()
     with torch.no_grad():
-        best = (evaluate(model, validation, 16)["adaptive"], 0, {k: v.clone() for k, v in branch.state_dict().items()})
+        best = (evaluate(model, validation, 16)["adaptive"], 0, snapshot(model))
     for epoch in range(1, epochs + 1):
         model.train()
         order = torch.randperm(len(query), device=query.device)
@@ -147,22 +163,46 @@ def train_last_branch(model: MultiBranchThinker, data: tuple, validation: tuple,
         with torch.no_grad():
             value = evaluate(model, validation, 16)["adaptive"]
         if value > best[0]:
-            best = (value, epoch, {k: v.clone() for k, v in branch.state_dict().items()})
-    branch.load_state_dict(best[2])
+            best = (value, epoch, snapshot(model))
+    restore(model, best[2])
     return best[0], best[1]
 
 
-def search_shape(model: MultiBranchThinker, data: tuple, validation: tuple, seed: int, epochs: int = 30) -> dict:
-    """Try every shape as a new branch; keep the best (ties within 0.01: fewer keys moved)."""
+def snapshot(model: MultiBranchThinker) -> dict:
+    """The trainable state while growing: the newest branch, and every older branch's relation gate."""
+    return {"new": {k: v.clone() for k, v in model.branches[-1].state_dict().items()},
+            "gates": [{k: v.clone() for k, v in old.relation_score.state_dict().items()} for old in model.branches[:-1]]}
+
+
+def restore(model: MultiBranchThinker, state: dict) -> None:
+    model.branches[-1].load_state_dict(state["new"])
+    for old, gate in zip(model.branches[:-1], state["gates"]):
+        old.relation_score.load_state_dict(gate)
+
+
+def search_shape(model: MultiBranchThinker, data: tuple, validation: tuple, seed: int, epochs: int = 40) -> dict:
+    """Try every shape as a new branch, and (if there is a branch) studying the newest branch more;
+    keep the best (ties within 0.01: refining first, then the shape that moves fewer keys)."""
     trials = []
+    gates = [{k: v.clone() for k, v in old.relation_score.state_dict().items()} for old in model.branches]
+    if len(model.branches):  # hypothesis 0: no new shape is needed, the newest branch needs more study
+        before = snapshot(model)
+        score, epoch = train_last_branch(model, data, validation, seed, epochs)
+        trials.append({"shape": "refine", "moved": -1, "score": round(score, 4), "epoch": epoch, "state": snapshot(model)})
+        restore(model, before)
     for n, shape in enumerate(SHAPES):
+        for old, gate in zip(model.branches, gates):
+            old.relation_score.load_state_dict(gate)
         model.add_branch(shape)
         score, epoch = train_last_branch(model, data, validation, seed, epochs)
         trials.append({"shape": shape.argmax(1).tolist(), "moved": moved(shape), "score": round(score, 4), "epoch": epoch,
-                       "state": {k: v.detach().clone() for k, v in model.branches[-1].state_dict().items()}})
+                       "state": snapshot(model)})
         del model.branches[-1]
+    for old, gate in zip(model.branches, gates):
+        old.relation_score.load_state_dict(gate)
     top = max(t["score"] for t in trials)
     chosen = min((t for t in trials if t["score"] >= top - 0.01), key=lambda t: (t["moved"], -t["score"]))
-    branch = model.add_branch(torch.eye(3)[chosen["shape"]])
-    branch.load_state_dict(chosen["state"])
+    if chosen["shape"] != "refine":
+        model.add_branch(torch.eye(3)[chosen["shape"]])
+    restore(model, chosen["state"])
     return {"chosen": chosen["shape"], "trials": [{k: v for k, v in t.items() if k != "state"} for t in trials]}
