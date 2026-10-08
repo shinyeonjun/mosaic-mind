@@ -101,12 +101,10 @@ class Thinker(nn.Module):
         return facts, links
 
     def think(self, index: torch.Tensor, query: torch.Tensor, steps: int, with_links: bool = False,
-              extra_facts: torch.Tensor | None = None, extra_mask: torch.Tensor | None = None,
-              extra_replace: bool = False):
+              extra_facts: torch.Tensor | None = None, extra_mask: torch.Tensor | None = None):
         """Per-step logits [T,B,3] and halting probabilities [T,B] (and link strengths [B,45] and
         every door's per-step logits [T,B,D,3]). `extra_facts` [B,D,3,M] are fact messages from
-        another part (rule world v4), used for the doors in `extra_mask` [B,D]: merged with what the board
-        says (max), or, with `extra_replace`, instead of it (MK1 stage F: an arbiter has already weighed both)."""
+        another part (rule world v4), used for the doors in `extra_mask` [B,D]."""
         facts, links = self.messages()
         pad = index >= self.features.shape[0]
         # Max over sentences: "does some single sentence say this?" Summing would let two
@@ -114,7 +112,7 @@ class Thinker(nn.Module):
         z0 = self.phi(facts[index]).masked_fill(pad[:, :, None, None, None], -1e4).amax(1)  # [B,D,3,W]
         if extra_facts is not None:
             extra = self.phi(extra_facts).masked_fill(~extra_mask[:, :, None, None], -1e4)
-            z0 = torch.where(extra_mask[:, :, None, None], extra, z0) if extra_replace else torch.maximum(z0, extra)
+            z0 = torch.maximum(z0, extra)
         strength = torch.sigmoid(self.link_score(self.psi(links[index]))).squeeze(-1)  # [B,U,45]
         strength = strength.masked_fill(pad[:, :, None], 0.0).amax(1)
         # A link exists or not: 0/1 in the forward pass, the soft value's gradient in training

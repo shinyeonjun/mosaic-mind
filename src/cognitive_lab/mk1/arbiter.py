@@ -80,7 +80,7 @@ def main() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     torch.manual_seed(args.seed)
     started = time.perf_counter()
-    model = MK1(device, articles_from_cache=True)  # training reads the v6 cache (bf16); the test reads live
+    model = MK1(device, seed=args.seed, articles_from_cache=True)  # training reads the v6 cache (bf16); the test reads live
     views = {}
     for part, seed, count in (("train", args.seed, args.train_sessions), ("validation", 0, None)):
         sessions = world.generate(part, seed, count, board_accuracies=BOARD_ACCURACIES)

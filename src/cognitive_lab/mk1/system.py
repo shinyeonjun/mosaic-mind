@@ -19,8 +19,11 @@ them (reading.articles), the real-text trust part picks a candidate answer or ык
 Which path a session takes is decided by what it brings: passages from sources, or speech and a board.
 
 Stage F (world v11, boards that can be wrong): "arbitrate" lets the arbiter (mk1/arbiter.py) weigh the
-board's and the article's word on the article door and replaces that door's fact with its conclusion;
-"article-only" replaces it with the article part's conclusion; "ask-available" merges both (max).
+board's and the article's word on the article door; "article-only" uses the article part's conclusion;
+"ask-available" merges both (max). For the first two the thinker is shown the board without its statements
+about the article door, and the conclusion comes in as a fact the stage-4 way (merged by max): the conditions
+the stage-4 adapter was trained in. (A first version replaced the door's fact message instead; it worked with
+the seed-45 thinker only: the audit found 0% transmission with the seed-46 thinker. design/audit-2026-10-08.md)
 
 Stage G: "verify-*" decide per question whether to ask the article part about the article door although
 the board may already say something. The router sees the arbiter's confidence before asking (which knows
@@ -47,7 +50,7 @@ from cognitive_lab.mk1.arbiter import door_scores as door_score
 from cognitive_lab.mk1.articles import ArticleReading, trust_inputs
 from cognitive_lab.mk1.board import Blackboard
 from cognitive_lab.mk1.reader import READING_MEMORY, ReaderService
-from cognitive_lab.mk1.relevance import board_relevant, fillers
+from cognitive_lab.mk1.relevance import board_relevant, doors_in, fillers
 from cognitive_lab.world2 import asking
 from cognitive_lab.world2.asking_system import COST as ASK_COST
 from cognitive_lab.world2.asking_system import CuriosityHead
@@ -196,7 +199,7 @@ class MK1(nn.Module):
             wanted = [(i, j) for i, x in enumerate(sentences) for j in board_relevant(x)]
             rows = self.reader.features([(sentences[i], THINKER_HYPOTHESES[j]) for i, j in wanted])
             features[[i for i, _ in wanted], [j for _, j in wanted]] = rows
-        board.write("reading.board", {"features": features, "index": posted}, "reader")
+        board.write("reading.board", {"features": features, "index": posted, "sentences": sentences}, "reader")
 
     # --- trust part (+ curiosity): speakers + memory -> each base door's key -------------------------
     def trust_turn(self, board: Blackboard, feedback: dict, query: torch.Tensor, curious: bool) -> None:
@@ -249,15 +252,16 @@ class MK1(nn.Module):
         board.write("curiosity.asked", torch.stack(asked_speaker, 1).flatten(), "curiosity")
 
     # --- thinker: board (+ facts from other parts) -> answer ---------------------------------------
-    def think(self, board: Blackboard, query: torch.Tensor, facts: dict | None = None, replace: bool = False):
+    def think(self, board: Blackboard, query: torch.Tensor, facts: dict | None = None, hide: torch.Tensor | None = None):
         reading = board.read("reading.board")
         kept = self.thinker.features
         self.thinker.features = reading["features"].to(self.device)
         try:
-            extra = {} if facts is None else {"extra_facts": facts["messages"], "extra_mask": facts["mask"],
-                                              "extra_replace": replace}
-            logits, _, strength, doors = self.thinker.think(reading["index"].flatten(0, 1).to(self.device), query, STEPS,
-                                                            with_links=True, **extra)
+            extra = {} if facts is None else {"extra_facts": facts["messages"], "extra_mask": facts["mask"]}
+            index = reading["index"].flatten(0, 1).to(self.device)
+            if hide is not None:  # [N,U] board sentences the thinker is not shown
+                index = index.masked_fill(hide, len(reading["sentences"]))
+            logits, _, strength, doors = self.thinker.think(index, query, STEPS, with_links=True, **extra)
         finally:
             self.thinker.features = kept
         stop = fixed_point_stop(self.thinker.last_changes)
@@ -334,7 +338,7 @@ class MK1(nn.Module):
         elif policy.startswith("verify-"):  # stage G: ask to verify, decided per question in order
             board.write("thinker.first", self.think(board, query), "thinker")
             self.verify_loop(board, sessions, query, policy.removeprefix("verify-"))
-        elif policy in ("article-only", "arbitrate"):  # stage F: the article door's fact is replaced
+        elif policy in ("article-only", "arbitrate"):  # stage F: one conclusion about the article door
             if policy == "arbitrate":
                 board.write("thinker.first", self.think(board, query), "thinker")
                 self.arbitrate(board, sessions)
@@ -345,12 +349,14 @@ class MK1(nn.Module):
         asked = board.read("router.asked")
         facts = None
         verify = policy.startswith("verify-")
-        fact_doors = board.read("doors.available") if verify else asked  # verify: the arbiter's word always replaces
+        fact_doors = board.read("doors.available") if verify else asked  # verify: the arbiter's word is always passed on
         if fact_doors.any():
             self.transmit(board, fact_doors)
             facts = board.read("facts.from_trust")
-        replace = policy in ("article-only", "arbitrate") or verify
-        board.write("answer.logits", self.think(board, query, facts, replace)["answer"], "thinker")
+        hide = None
+        if policy in ("article-only", "arbitrate") or verify:  # the board's own statements about the article door
+            hide = self.statements_about_article_doors(board, sessions)
+        board.write("answer.logits", self.think(board, query, facts, hide)["answer"], "thinker")
         self.reader.save()
         return {"logits": board.read("answer.logits"), "asks": asked.float().sum(1), "speaker_asks": speaker_asks,
                 "targets": targets}, board
@@ -412,6 +418,17 @@ class MK1(nn.Module):
         rows = torch.arange(len(p), device=self.device)
         conclusions[rows, views["door"]] = nn.functional.one_hot(pick, 3).float() * 20.0 * (best > 0.5)[:, None]
         board.write("doors.conclusions", conclusions, "arbiter")
+
+    def statements_about_article_doors(self, board: Blackboard, sessions: list[dict]) -> torch.Tensor:
+        """[N,U] board sentences that name only the episode's article door (its key statements). Found by door
+        names in the text: the rule-world hand rule of mk1/relevance.py."""
+        reading = board.read("reading.board")
+        sentences = reading["sentences"]
+        index = reading["index"].flatten(0, 1)
+        doors = [e["article"]["door"] for s in sessions for e in s["episodes"]]
+        about = [doors_in(x) for x in sentences] + [set()]  # last: padding
+        hide = torch.tensor([[about[j] == {d} for j in row] for row, d in zip(index.tolist(), doors)])
+        return hide.to(self.device)
 
     def verify_loop(self, board: Blackboard, sessions: list[dict], query: torch.Tensor, mode: str) -> None:
         """Per question, in order: the arbiter's view without asking -> decide whether to ask the article part
