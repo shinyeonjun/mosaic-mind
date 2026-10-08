@@ -73,10 +73,15 @@ def mk1_answers(exam: list[dict], device: torch.device) -> list[str]:
     return answers
 
 
-def llm_answers(exam: list[dict], device: torch.device, adapter: Path | None) -> list[str]:
+def llm_answers(exam: list[dict], device: torch.device, adapter: Path | None, no_unknown: bool = False) -> list[str]:
+    """`no_unknown`: the model may not write 모름 (KorQuAD questions all have answers; the reading specialist is
+    likewise run without its no-answer option), so both systems answer every question."""
     from cognitive_lab.mk1.versus import LanguageModel
 
     model = LanguageModel(device, adapter)
+    if no_unknown:
+        banned = [ids for ids in {tuple(model.tokenizer(w, add_special_tokens=False)["input_ids"]) for w in ("모름", " 모름")}]
+        model.bad_words_ids = [list(ids) for ids in banned]
     answers, started = [], time.perf_counter()
     for q in exam:
         answers.append(model.generate([{"role": "system", "content": PROMPT},
@@ -90,14 +95,15 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="KorQuAD 1.0 as an external exam")
     parser.add_argument("--system", choices=("mk1", "llm"), required=True)
     parser.add_argument("--adapter", type=Path, default=None)
+    parser.add_argument("--no-unknown", action="store_true", help="the language model may not answer 모름")
     args = parser.parse_args()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     exam = load_exam()
     seen = contamination(exam)
     started = time.perf_counter()
-    answers = mk1_answers(exam, device) if args.system == "mk1" else llm_answers(exam, device, args.adapter)
+    answers = mk1_answers(exam, device) if args.system == "mk1" else llm_answers(exam, device, args.adapter, args.no_unknown)
     seconds = time.perf_counter() - started
-    name = args.system if args.adapter is None else f"llm-{args.adapter.stem}"
+    name = (args.system if args.adapter is None else f"llm-{args.adapter.stem}") + ("-no-unknown" if args.no_unknown else "")
     rows = [(exact(a, q["answers"]), char_f1(a, q["answers"]), float(klue.is_right(a, q["answers"])), s)
             for q, a, s in zip(exam, answers, seen, strict=True)]
 
