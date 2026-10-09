@@ -1,15 +1,15 @@
-"""MK1 v2 on RGB: satellites with separate jobs, combined by explicit decisions (design/agi-blueprint-2026-10-09.md, 1).
+"""MK1 v2 on RGB: the speaking satellite answers, other satellites decide whether it may (design/agi-blueprint-2026-10-09.md, 1).
 
 Per question (5 documents):
-  read (two channels)   Gemma 4 E2B writes a short answer from the documents; the KLUE-trained mDeBERTa reader
-                        finds the best span per document with a no-answer score
-  verify                mDeBERTa NLI: does a document entail "the answer to <question> is <answer>"?
-  recall                Gemma 4 E2B without the documents: what it already knew
-  decide                evidence = reader margin (best span score - no-answer score) and NLI support;
-                        no evidence -> reject; documents vs recall disagree, recall absent from every document and
-                        the documents' answer -> report factual errors and give the recalled answer
-  speak                 the decision in the exam's wording
-The thresholds are set on the development 10% only (`tune`), then frozen for the sealed 90%.
+  speak    Gemma 4 E2B answers from the documents with the exam's own prompt (exactly what "E2B alone" does)
+  read     the English reading satellite (KLUE reader continued on SQuAD 2.0, mk1v2/reader_en.py): best span per
+           document and its no-answer score -> evidence margin = best span score - no-answer score
+  verify   mDeBERTa NLI: does a document entail "the answer to <question> is <short answer>"?
+  decide   no evidence (margin and support both under their thresholds) -> reject; the speaker rejected but the
+           evidence is strong -> answer with the short answer; otherwise keep the speaker's reply
+A first version re-assembled the answer from the satellites' short answers and lost Gemma's multi-fact answers
+(integration 0.8 -> 0.4); it is kept in git history. Error detection (counterfactual) needs a knowledge satellite
+(next step B) and is not attempted here. Thresholds are set on the development 10% only, then frozen.
 """
 
 import json
@@ -18,6 +18,7 @@ import statistics
 import torch
 
 from cognitive_lab.mk1v2 import rgb
+from cognitive_lab.mk1v2.reader_en import CHECKPOINT as READER_EN
 
 REJECT = "I can not answer the question because of the insufficient information in documents."
 ERRORS = "There are factual errors in the provided documents."
@@ -31,7 +32,7 @@ class Satellites:
         from cognitive_lab.world5.reader_qa import Reader
 
         self.device, self.llm = device, llm
-        self.reader = Reader(device)
+        self.reader = Reader(device, checkpoint=READER_EN)
         self.nli_tok = AutoTokenizer.from_pretrained(NLI_DIR)
         self.nli = AutoModelForSequenceClassification.from_pretrained(NLI_DIR).to(device).eval()
         labels = {v.lower(): int(k) for k, v in self.nli.config.id2label.items()}
@@ -58,30 +59,27 @@ class Satellites:
     def signals(self, item: dict) -> dict:
         reads = self.reader.read_many([(item["query"], d) for d in item["docs"]])
         best = max(reads, key=lambda r: r["span_score"] - r["null_score"])
-        llm_answer = self.doc_answer(item["query"], item["docs"])
-        recalled = self.recall(item["query"])
-        entail, _ = self.support(item["docs"], item["query"], llm_answer)
-        recall_entail, recall_contra = self.support(item["docs"], item["query"], recalled)
-        in_docs = any(recalled.lower() in d.lower() for d in item["docs"]) if recalled else False
-        return {"id": item["id"], "llm_answer": llm_answer, "reader_answer": best["answer"],
-                "reader_margin": best["span_score"] - best["null_score"], "support": entail, "recall": recalled,
-                "recall_support": recall_entail, "recall_contradiction": recall_contra, "recall_in_docs": in_docs,
-                "recall_agrees": bool(recalled) and (recalled.lower() in llm_answer.lower() or llm_answer.lower() in recalled.lower())}
+        base = self.llm.chat([{"role": "system", "content": rgb.SYSTEM},
+                              {"role": "user", "content": rgb.INSTRUCTION.format(DOCS="\n".join(item["docs"]), QUERY=item["query"])}],
+                             max_tokens=200)
+        short = self.doc_answer(item["query"], item["docs"])
+        entail, _ = self.support(item["docs"], item["query"], short)
+        return {"id": item["id"], "base_reply": base, "short_answer": short, "reader_answer": best["answer"],
+                "reader_margin": best["span_score"] - best["null_score"], "support": entail}
 
 
 def decide(s: dict, t: dict) -> str:
-    """The reply, from signals `s` and thresholds `t` (margin, support, contradiction)."""
+    """The reply, from signals `s` and thresholds `t` (margin, support)."""
     evidence = s["reader_margin"] >= t["margin"] or s["support"] >= t["support"]
+    speaker_rejected = "insufficient information" in s["base_reply"]
     if not evidence:
         return REJECT
-    if (not s["recall_agrees"]) and (not s["recall_in_docs"]) and s["recall_contradiction"] >= t["contradiction"]:
-        return f"{ERRORS} The answer is {s['recall']}."
-    return s["llm_answer"] if s["support"] >= t["support"] or not s["reader_answer"] else (
-        s["llm_answer"] if s["reader_margin"] < t["margin"] else s["reader_answer"] + " / " + s["llm_answer"])
+    if speaker_rejected and s["reader_margin"] >= t["margin"] and s["support"] >= t["support"]:
+        return s["short_answer"]
+    return s["base_reply"]
 
 
-GRID = {"margin": [-4.0, -3.0, -2.0, -1.0, 0.0, 1.0], "support": [0.2, 0.3, 0.4, 0.5, 0.6],
-        "contradiction": [0.5, 0.7, 0.9, 1.01]}  # 1.01 = never report errors
+GRID = {"margin": [-6.0, -4.0, -3.0, -2.0, -1.0, 0.0, 1.0, 99.0], "support": [0.2, 0.3, 0.4, 0.5, 0.6, 99.0]}  # 99 = off
 
 
 def evaluate(signals: dict, items: dict, t: dict) -> dict:
@@ -93,22 +91,18 @@ def evaluate(signals: dict, items: dict, t: dict) -> dict:
 
 
 def objective(scores: dict) -> float:
-    """Mean of the primary metric per testbed (accuracy; rejection rate; error detection for counterfactual)."""
-    values = []
-    for setting, sc in scores.items():
-        values.append(sc.get("rejection_rate", sc.get("error_detection_rate") if setting == "counterfactual" else sc.get("accuracy")))
-    return statistics.mean(values)
+    """The pre-registered primary metric: mean net score over the testbeds (design/mk1-v2-spec.md, 6)."""
+    return statistics.mean(sc["net"] for sc in scores.values())
 
 
 def tune(signals: dict, items: dict) -> dict:
     best = None
     for m in GRID["margin"]:
         for su in GRID["support"]:
-            for c in GRID["contradiction"]:
-                t = {"margin": m, "support": su, "contradiction": c}
-                value = objective(evaluate(signals, items, t))
-                if best is None or value > best[0]:
-                    best = (value, t)
+            t = {"margin": m, "support": su}
+            value = objective(evaluate(signals, items, t))
+            if best is None or value > best[0]:
+                best = (value, t)
     return best[1]
 
 
@@ -116,7 +110,7 @@ def run_mk1(part: str, settings: list[str]) -> dict:
     from cognitive_lab.mk1v2.llm_service import LLMService
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    cache = rgb.RESULTS / f"mk1v2-rgb-signals_{part}.json"
+    cache = rgb.RESULTS / f"mk1v2-rgb-signals-v2_{part}.json"
     items = {s: {it["id"]: it for it in rgb.exam(s, part)} for s in settings}
     if cache.exists():
         signals = json.loads(cache.read_text(encoding="utf-8"))

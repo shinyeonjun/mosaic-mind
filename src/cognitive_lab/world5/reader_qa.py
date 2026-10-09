@@ -96,12 +96,12 @@ def training_features(tokenizer, rows: list[dict]) -> dict[str, torch.Tensor]:
             "start_positions": torch.tensor(starts), "end_positions": torch.tensor(ends)}
 
 
-def load_model(device: torch.device, trained: bool):
+def load_model(device: torch.device, trained: bool, checkpoint=None):
     from transformers import AutoModelForQuestionAnswering
 
     model = AutoModelForQuestionAnswering.from_pretrained(BASE_DIR, dtype=torch.float32)
     if trained:
-        model.load_state_dict(torch.load(CHECKPOINT, map_location="cpu"))
+        model.load_state_dict(torch.load(checkpoint or CHECKPOINT, map_location="cpu"))
     return model.to(device)
 
 
@@ -218,7 +218,7 @@ class Reader:
     (10 of 300 test answers did). `precise=False` is the bf16 reading the v5/v6 caches were made with.
     `precision="fp16"` is the fast mode (about 2.4x on the laptop GPU; see design/mk1-integration.md)."""
 
-    def __init__(self, device: torch.device, precise: bool = True, precision: str | None = None):
+    def __init__(self, device: torch.device, precise: bool = True, precision: str | None = None, checkpoint=None):
         from transformers import AutoTokenizer
 
         self.device = device
@@ -226,7 +226,7 @@ class Reader:
         self.precise = self.precision == "fp32"
         self.half = {"fp16": torch.float16, "bf16": torch.bfloat16}.get(self.precision)
         self.tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_DIR)
-        self.model = load_model(device, trained=True).eval()
+        self.model = load_model(device, trained=True, checkpoint=checkpoint).eval()
 
     @torch.no_grad()
     def spans(self, question: str, context: str, k: int = 1, max_tokens: int = MAX_ANSWER_TOKENS):

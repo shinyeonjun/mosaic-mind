@@ -122,9 +122,22 @@ def exam(setting: str, part: str) -> list[dict]:
     return items
 
 
+def net(setting: str, j: dict) -> int:
+    """The pre-registered net score (design/mk1-v2-spec.md, 6): +1 right, 0 no answer, -1 wrong. Counterfactual: +1
+    only for reporting the errors and giving the right answer; 0 for reporting errors without it, for a rejection, or
+    for the right answer without a report (not listed in the rule, scored conservatively); -1 otherwise."""
+    if setting == "rejection":
+        return 1 if j["rejected"] else -1
+    if setting == "counterfactual":
+        if j["error_detected"] and j["right"]:
+            return 1
+        return 0 if (j["error_detected"] or j["rejected"] or j["right"]) else -1
+    return 1 if j["right"] else (0 if j["rejected"] else -1)
+
+
 def score(setting: str, judged: list[dict]) -> dict:
     n = len(judged)
-    out = {"questions": n}
+    out = {"questions": n, "net": round(sum(net(setting, j) for j in judged) / n, 4)}
     if setting == "rejection":
         out["rejection_rate"] = round(sum(j["rejected"] for j in judged) / n, 4)
     else:
