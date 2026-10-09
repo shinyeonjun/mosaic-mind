@@ -50,13 +50,14 @@ def difference(a: dict, b: dict, draws: int = 2000) -> dict:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--set", choices=("dev", "final"), default="dev")
+    parser.add_argument("--set", choices=("dev", "final", "final2"), default="dev")
     args = parser.parse_args()
-    systems = {s: rights(s, args.set) for s in ("mk1", "e2b", "e4b") if (RESULTS / f"exam-taskstream_{s}_{args.set}.json").exists()}
+    systems = {s: rights(s, args.set) for s in ("mk1", "mk1-v2", "e2b", "e4b") if (RESULTS / f"exam-taskstream_{s}_{args.set}.json").exists()}
     out = {"part": args.set, "accuracy": {s: {c: round(score(r[c]), 4) for c in r} for s, r in systems.items()}, "versus": {}}
-    for opponent in ("e2b", "e4b"):
-        if opponent in systems and "mk1" in systems:
-            out["versus"][opponent] = {c: difference(systems["mk1"][c], systems[opponent][c]) for c in ("named", "symbolic")}
+    for mine in ("mk1", "mk1-v2"):
+        for opponent in ("e2b", "e4b", "mk1"):
+            if mine in systems and opponent in systems and mine != opponent:
+                out["versus"][f"{mine} - {opponent}"] = {c: difference(systems[mine][c], systems[opponent][c]) for c in ("named", "symbolic")}
     print(json.dumps(out, indent=1))
     (RESULTS / f"exam-taskstream_verdict_{args.set}.json").write_text(json.dumps(out, indent=1), encoding="utf-8")
 

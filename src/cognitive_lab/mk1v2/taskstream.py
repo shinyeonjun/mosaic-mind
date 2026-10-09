@@ -29,7 +29,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[3]
 DATA = ROOT / "data" / "taskstream"
 RESULTS = ROOT / "artifacts" / "results"
-SIZES = {"dev": 100, "final": 200}
+SIZES = {"dev": 100, "final": 200, "final2": 200}  # final2: rows 300-500, sealed after final was opened
 K_EXAMPLES = 16
 TASKS = {
     "sst2": ("sst2_validation.parquet", "sentence", "label", ["negative", "positive"]),
@@ -62,9 +62,9 @@ def stream(part: str, condition: str) -> list[dict]:
     for task in order:
         rows = _rows(task)
         random.Random(f"taskstream|{task}").shuffle(rows)
-        dev, final = rows[:SIZES["dev"]], rows[SIZES["dev"]:SIZES["dev"] + SIZES["final"]]
+        start = {"dev": 0, "final": 100, "final2": 300}[part]
         names = TASKS[task][3] if condition == "named" else list(SYMBOLS[:len(TASKS[task][3])])
-        out.append({"task": task, "labels": names, "items": dev if part == "dev" else final})
+        out.append({"task": task, "labels": names, "items": rows[start:start + SIZES[part]]})
     return out
 
 
@@ -95,23 +95,34 @@ def run_gemma(name: str, part: str) -> dict:
     return result
 
 
+EYES = {"e5-small": "multilingual-e5-small", "bge-large": "bge-large-en-v1.5"}
+
+
 class Embedder:
-    def __init__(self, device):
+    """e5-small: mean pooling with the "query: " prefix; bge-large: the CLS vector, no prefix (BGE's own usage)."""
+
+    def __init__(self, device, eye: str = "e5-small"):
         import torch
         from transformers import AutoModel, AutoTokenizer
 
         self.torch, self.device = torch, device
-        directory = ROOT / "model" / "multilingual-e5-small"
+        self.eye = eye
+        directory = ROOT / "model" / EYES[eye]
         self.tokenizer = AutoTokenizer.from_pretrained(directory)
         self.model = AutoModel.from_pretrained(directory).to(device).eval()
 
     def __call__(self, texts: list[str]):
         torch = self.torch
         with torch.no_grad():
-            x = self.tokenizer(["query: " + t for t in texts], padding=True, truncation=True, max_length=128, return_tensors="pt").to(self.device)
-            h = self.model(**x).last_hidden_state
-            e = (h * x["attention_mask"][..., None]).sum(1) / x["attention_mask"].sum(1, keepdim=True)
-            return torch.nn.functional.normalize(e, dim=-1).cpu()
+            out = []
+            for b in range(0, len(texts), 32):
+                chunk = texts[b:b + 32] if self.eye == "bge-large" else ["query: " + t for t in texts[b:b + 32]]
+                x = self.tokenizer(chunk, padding=True, truncation=True, max_length=256 if self.eye == "bge-large" else 128,
+                                   return_tensors="pt").to(self.device)
+                h = self.model(**x).last_hidden_state
+                e = h[:, 0] if self.eye == "bge-large" else (h * x["attention_mask"][..., None]).sum(1) / x["attention_mask"].sum(1, keepdim=True)
+                out.append(torch.nn.functional.normalize(e, dim=-1).cpu())
+            return torch.cat(out)
 
 
 class ZeroShot:
@@ -144,36 +155,44 @@ def parse(reply: str, labels: list[str], condition: str) -> int | None:
     return min(found)[1] if found else None
 
 
-def run_mk1(part: str, prior_strength: float = 2.0, channels: tuple = ("proto", "speaker")) -> dict:
+def run_mk1(part: str, prior_strength: float = 2.0, channels: tuple = ("proto", "speaker"), version: str = "v1") -> dict:
     """Channels weighed by per-channel counts in this task (Beta(prior_strength / 2, prior_strength / 2) start, as the
     counting arbiter):
       proto    the part grown for this task: prototypes of frozen e5-small embeddings, updated with every feedback
       speaker  Gemma 4 E2B's guess (its replies from the gemma-e2b run of this part: the same call, made once)
       zero     the NLI satellite's zero-shot guess (named only; on dev it never helped, so it is off in the frozen MK1)
+    version v1: e5-small eye, raw class means (frozen for the final set).
+    version v2: bge-large eye, normalised class means compared after subtracting the mean of the texts seen so far
+                (online centring: only the past is used); chosen on dev, judged on final2.
     """
     import torch
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    embed = Embedder(device)
+    embed = Embedder(device, "bge-large" if version == "v2" else "e5-small")
     zero = ZeroShot(device) if "zero" in channels else None
     speaker = None
     if "speaker" in channels:
         speaker = json.loads((RESULTS / f"exam-taskstream_e2b_{part}.json").read_text(encoding="utf-8"))["conditions"]
-    result = {"system": f"MK1 ({' + '.join(channels)} channels, counting arbiter)", "part": part, "conditions": {}}
+    result = {"system": f"MK1 {version} ({' + '.join(channels)} channels, counting arbiter)", "part": part, "conditions": {}}
     for condition in ("named", "symbolic"):
         tasks = []
         for task in stream(part, condition):
             replies = {t["task"]: t["replies"] for t in speaker[condition]["tasks"]}[task["task"]] if speaker else None
             labels, n = task["labels"], len(task["labels"])
             vectors = embed([it["text"] for it in task["items"]])
-            sums, counts = torch.zeros(n, vectors.shape[1]), torch.zeros(n)
+            sums, counts, total = torch.zeros(n, vectors.shape[1]), torch.zeros(n), torch.zeros(vectors.shape[1])
             hits = {c: [0.0, 0.0] for c in channels}  # right, spoke
             right = []
             for t, (v, item) in enumerate(zip(vectors, task["items"])):
                 said = {}
                 if "proto" in channels and counts.sum() > 0:
                     seen = counts > 0
-                    sims = torch.where(seen, (sums / counts.clamp(min=1)[:, None]) @ v, torch.full((n,), -9.0))
+                    if version == "v2":
+                        m = total / t
+                        means = torch.nn.functional.normalize(sums / counts.clamp(min=1)[:, None] - m, dim=-1)
+                        sims = torch.where(seen, means @ torch.nn.functional.normalize(v - m, dim=0), torch.full((n,), -9.0))
+                    else:
+                        sims = torch.where(seen, (sums / counts.clamp(min=1)[:, None]) @ v, torch.full((n,), -9.0))
                     said["proto"] = int(sims.argmax())
                 if speaker is not None and (g := parse(replies[t], labels, condition)) is not None:
                     said["speaker"] = g
@@ -193,21 +212,22 @@ def run_mk1(part: str, prior_strength: float = 2.0, channels: tuple = ("proto", 
                     hits[channel][1] += 1
                 sums[item["label"]] += v
                 counts[item["label"]] += 1
+                total += v
             tasks.append({"task": task["task"], "accuracy": round(statistics.mean(right), 4), "right": right})
-            print("mk1", condition, task["task"], tasks[-1]["accuracy"], flush=True)
+            print(f"mk1-{version}", condition, task["task"], tasks[-1]["accuracy"], flush=True)
         result["conditions"][condition] = {"accuracy": round(statistics.mean(t["accuracy"] for t in tasks), 4), "tasks": tasks}
     return result
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Skill acquisition on a stream of new tasks")
-    parser.add_argument("--system", required=True, help="e2b | e4b | mk1")
-    parser.add_argument("--set", choices=("dev", "final"), default="dev")
+    parser.add_argument("--system", required=True, help="e2b | e4b | mk1 | mk1-v2")
+    parser.add_argument("--set", choices=("dev", "final", "final2"), default="dev")
     parser.add_argument("--final", action="store_true", help="required to read the sealed final texts")
     args = parser.parse_args()
-    if args.set == "final" and not args.final:
+    if args.set != "dev" and not args.final:
         raise SystemExit("the final set is sealed: pass --final, once, when the system is frozen")
-    result = run_mk1(args.set) if args.system == "mk1" else run_gemma(args.system, args.set)
+    result = run_mk1(args.set, version="v2" if args.system == "mk1-v2" else "v1") if args.system.startswith("mk1") else run_gemma(args.system, args.set)
     path = RESULTS / f"exam-taskstream_{args.system}_{args.set}.json"
     path.write_text(json.dumps(result, ensure_ascii=False, indent=1), encoding="utf-8")
     print(json.dumps({c: v["accuracy"] for c, v in result["conditions"].items()}))
