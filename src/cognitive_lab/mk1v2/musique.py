@@ -96,7 +96,7 @@ def run_llm(name: str, part: str) -> dict:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="MuSiQue-Full as an external exam")
-    parser.add_argument("--system", required=True, help="e2b | e4b | mk1")
+    parser.add_argument("--system", required=True, help="e2b | e4b | mk1 | mk1-think")
     parser.add_argument("--set", choices=("dev", "final"), default="dev")
     parser.add_argument("--final", action="store_true", help="required to read the sealed 90%%")
     args = parser.parse_args()
@@ -104,7 +104,11 @@ def main() -> None:
         raise SystemExit("the final set is sealed: pass --final, once, when the system is frozen")
     if args.system in ("e2b", "e4b"):
         result = run_llm(args.system, args.set)
-    else:
+    elif args.system == "mk1-think":  # the learned thinking satellite (mk1v2/think.py)
+        from cognitive_lab.mk1v2.think import run
+
+        result = run(args.set)
+    else:  # the first, prompt-split multi-hop pipeline (kept for the record)
         from cognitive_lab.mk1v2.multihop import run_mk1_musique
 
         result = run_mk1_musique(args.set)
