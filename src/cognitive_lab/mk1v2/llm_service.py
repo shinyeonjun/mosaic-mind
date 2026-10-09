@@ -51,7 +51,7 @@ class LLMService:
             self.process.wait(timeout=30)
 
     def chat(self, messages: list[dict], max_tokens: int = 256, temperature: float = 0.0, schema: dict | None = None) -> str:
-        body = {"messages": messages, "temperature": temperature, "max_tokens": max_tokens,
+        body = {"messages": messages, "temperature": temperature, "max_tokens": max_tokens, "seed": 0,
                 "chat_template_kwargs": {"enable_thinking": False}}
         if schema is not None:
             body["response_format"] = {"type": "json_schema", "json_schema": {"name": "out", "schema": schema}}
