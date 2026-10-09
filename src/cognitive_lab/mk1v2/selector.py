@@ -70,7 +70,10 @@ class Selector:
 
         self.device = device
         self.tokenizer = AutoTokenizer.from_pretrained(BASE)
-        self.model = AutoModelForSequenceClassification.from_pretrained(BASE, num_labels=1, ignore_mismatched_sizes=True)
+        # dtype=float32: the checkpoint config says float16, and AdamW on float16 weights turned every weight nan on the
+        # first step (a first training run ended at 3.8% both-supporting-found, below chance).
+        self.model = AutoModelForSequenceClassification.from_pretrained(BASE, num_labels=1, ignore_mismatched_sizes=True,
+                                                                        dtype=torch.float32)
         if checkpoint is not None:
             self.model.load_state_dict(torch.load(checkpoint, map_location="cpu"))
         self.model.to(device).eval()
