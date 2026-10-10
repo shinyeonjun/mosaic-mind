@@ -24,6 +24,23 @@ FEATURES = {
               "reader_margin", "reply_has_reader", "chain1", "chain2"],
     "answerable": ["rejected", "lp_mean", "lp_min", "sample_same_choice", "reader_margin", "chain1", "chain2"],
 }
+# Per-document reading features (mk1v3/reader_features.py: docs_positive, margin_second, docs_agree_reply,
+# docs_agree_best) were tried and left out: they did not transfer (RGB dev 0.808 -> 0.739, its answerable AUROC
+# 0.906 -> 0.835; RGB spreads the answer over many news documents, unlike the calibration data).
+SIDE = ROOT / "artifacts" / "results" / "mk1v3-reader-features.jsonl"
+
+
+def merge(rows: list[dict]) -> list[dict]:
+    """Adds the per-document reading features (mk1v3/reader_features.py) to recorded rows."""
+    side = {}
+    if SIDE.exists():
+        for line in SIDE.read_text(encoding="utf-8").splitlines():
+            d = json.loads(line)
+            side[d.pop("id")] = d
+    for r in rows:
+        r.update(side.get(r["id"], {}))
+        r["rejected"] = float(r["rejected"])
+    return rows
 
 
 class Logistic:
@@ -140,9 +157,7 @@ def report(rows: list[dict]) -> dict:
 
 
 def main() -> None:
-    rows = [json.loads(l) for l in SIGNALS.read_text(encoding="utf-8").splitlines()]
-    for r in rows:
-        r["rejected"] = float(r["rejected"])
+    rows = merge([json.loads(l) for l in SIGNALS.read_text(encoding="utf-8").splitlines()])
     out = report(rows)
     print(json.dumps(out, indent=1))
     models = {h: Logistic().fit(*matrix(head_rows(rows, h), h)).to_dict() for h in FEATURES}

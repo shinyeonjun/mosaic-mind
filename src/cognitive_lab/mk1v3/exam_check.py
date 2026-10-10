@@ -9,7 +9,7 @@ import statistics
 
 import numpy as np
 
-from cognitive_lab.mk1v3.calibrate import FEATURES, WEIGHTS, Logistic, auroc, decide, ece, head_rows, matrix
+from cognitive_lab.mk1v3.calibrate import FEATURES, WEIGHTS, Logistic, auroc, decide, ece, head_rows, matrix, merge
 from cognitive_lab.mk1v3.signals import ROOT
 
 OUT = ROOT / "artifacts" / "results" / "mk1v3-exam-dev-signals.jsonl"
@@ -58,8 +58,7 @@ def main() -> None:
                 if n % 50 == 0:
                     print(f"  {n}/{len(todo)}", flush=True)
     rows = [rejudge(json.loads(l), by_id[json.loads(l)["id"]]) for l in OUT.read_text(encoding="utf-8").splitlines()]
-    for r in rows:
-        r["rejected"] = float(r["rejected"])
+    rows = merge(rows)
     saved = json.loads(WEIGHTS.read_text(encoding="utf-8"))
     models = {h: Logistic.from_dict(saved["models"][h]) for h in FEATURES}
     out = {}
