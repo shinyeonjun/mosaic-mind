@@ -74,6 +74,26 @@
 - 하지만 세계 최고 팀들도 여기서 막혀 있다(ARC-AGI-2 최고 24%). 노트북 한 대에서 기대할 수 있는 것은 **작은 규모에서 원리를 증명하는 것**(배우지 않은 개념 가족으로의 빠른 적응)이지, 점수 경쟁이 아니다.
 - 실패해도 남는 것: 우리만의 합성 과제 생성기(평가와 교과과정에 계속 씀), 처음부터 학습한 작은 격자 모델(생각 위성의 직관 부분).
 
+## 9. 1단계 결과: 생성기 (2026-10-11)
+
+`src/cognitive_lab/concepts/generator.py`. 개념 가족 28개(물체 8, 기하 9, 수 5, 목표 지향 4, 비교 2). 과제마다 매개변수(색, 방향, 크기, 개수)가 바뀌므로 예시에서 읽어 내야 한다. 과제 = 예시 3쌍 + 시험 1쌍, 격자 대부분 6–14칸.
+
+**오염 기록**: ConceptARC 과제를 보지 않고 핵심 지식 사전에서 출발해 썼다. 다만 ConceptARC 개념 이름 16개와 최소 과제 16개는 이전에 봤으므로 이름이 겹치는 가족이 있다. ConceptARC corpus는 봉인 그대로.
+
+**검사** (`--check`, 가족마다 과제 30개 생성, 그중 10개를 지금 탐색기로 3초씩):
+
+| 탐색기가 푼 비율 | 가족 수 | 가족 |
+|---|---|---|
+| 10/10 | 7 | crop, recolour_by_colour, flip, rotate, mirror_complete, scale_up, gravity |
+| 3–9/10 | 6 | recolour_by_size 9, size_parity 8, extend_to_wall 8, remove_noise 6, tile 6, fill_holes 3 |
+| 0/10 | 15 | recolour_largest, keep_extreme, outline, remove_border_touching, translate, inside_frame, centre_dot, connect_pairs, count_to_bar, majority_colour, sort_bars, move_until_obstacle, ray_until_obstacle, keep_same_shape, odd_one_out |
+
+- 유효성: 28개 가족 모두 30/30(같은 입력 중복, 입력 = 출력인 쌍은 버림). 0/10 가족의 예시를 눈으로 확인했고 개념대로 만들어진다(생성기 오류가 아니라 탐색기의 기본 동작으로 표현이 안 되는 것).
+- **관문 통과**: 푼 비율이 가족마다 다양하다(전부 풂 7, 일부 6, 못 풂 15). 못 푸는 15개가 2단계 개념 학습기가 배워야 할 몫이다.
+- 고친 버그: 1×1 상자에서 모양 그리기가 끝나지 않던 무한 반복, translate가 작은 격자에서 범위를 넘던 문제.
+
+다음(2단계): 학습에 안 쓸 개념 가족을 학습 전에 정해 커밋한 뒤, 작은 격자 모델을 처음부터 학습.
+
 ## 출처
 
 - TRM: Jolicoeur-Martineau, "Less is More: Recursive Reasoning with Tiny Networks", arXiv 2510.04871 (ARC Prize 2025 논문 부문 1등). 학습 비용은 후속 논문 리뷰(2차 출처) 기준.
