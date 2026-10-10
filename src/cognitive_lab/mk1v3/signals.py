@@ -70,6 +70,33 @@ def hotpot_items(n: int) -> list[dict]:
     return items
 
 
+def musique_train_items(n: int) -> list[dict]:
+    """MuSiQue-Full TRAIN (the exam uses dev): twin pairs built the way mk1v2/musique.py builds the exam."""
+    from collections import defaultdict
+
+    by_id = defaultdict(list)
+    with (ROOT / "data" / "musique" / "data" / "musique_full_v1.0_train.jsonl").open(encoding="utf-8") as f:
+        for line in f:
+            row = json.loads(line)
+            by_id[row["id"]].append(row)
+    ids = sorted(i for i, rows in by_id.items() if len(rows) == 2)
+    random.Random("v3-calib-musique").shuffle(ids)
+    items = []
+    for qid in ids[:n // 2]:
+        for row in sorted(by_id[qid], key=lambda r: not r["answerable"]):
+            rng = random.Random(f"v3-calib-musique|{qid}|{row['answerable']}")
+            support = [p for p in row["paragraphs"] if p["is_supporting"]] if row["answerable"] else []
+            others = [p for p in row["paragraphs"] if not p["is_supporting"]]
+            rng.shuffle(others)
+            docs = support + others[:PASSAGES - len(support)]
+            rng.shuffle(docs)
+            items.append({"id": f"musique-train|{qid}|{'a' if row['answerable'] else 'u'}", "source": "musique-train",
+                          "query": row["question"], "docs": [f"{p['title']}: {p['paragraph_text']}" for p in docs],
+                          "answers": [a for a in [row["answer"]] + row.get("answer_aliases", []) if a],
+                          "answerable": row["answerable"]})
+    return items
+
+
 def words(t: str) -> set:
     return set("".join(c.lower() if c.isalnum() else " " for c in t).split())
 
@@ -135,8 +162,9 @@ def main() -> None:
 
     parser = argparse.ArgumentParser(description="Record satellite signals for calibration (not on exams)")
     parser.add_argument("--per-source", type=int, default=300)
+    parser.add_argument("--musique-train", type=int, default=0, help="also record this many MuSiQue train questions")
     args = parser.parse_args()
-    items = squad_items(args.per_source) + hotpot_items(args.per_source)
+    items = squad_items(args.per_source) + hotpot_items(args.per_source) + musique_train_items(args.musique_train)
     done = {json.loads(l)["id"] for l in OUT.read_text(encoding="utf-8").splitlines()} if OUT.exists() else set()
     todo = [it for it in items if it["id"] not in done]
     print(f"{len(items)} questions, {len(done)} already recorded, {len(todo)} to go", flush=True)
