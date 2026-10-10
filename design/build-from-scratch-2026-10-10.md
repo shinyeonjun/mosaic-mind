@@ -94,6 +94,29 @@
 
 다음(2단계): 학습에 안 쓸 개념 가족을 학습 전에 정해 커밋한 뒤, 작은 격자 모델을 처음부터 학습.
 
+## 10. 2단계 사전 등록: 작은 개념 학습기 (2026-10-11, 학습 전에 커밋)
+
+**질문**: 다른 개념 가족들로 미리 학습한 작은 모델이, 처음 보는 개념 가족을 처음부터 학습하는 같은 크기 모델보다 적은 예시로 더 정확히 배우는가(배우는 법 배우기의 첫 증거).
+
+**가족 나누기** (`src/cognitive_lab/concepts/split.py`, 시드 고정, 그룹별 층화):
+- train 17: outline, crop, recolour_by_colour, recolour_largest, fill_holes, connect_pairs, mirror_complete, inside_frame, tile, scale_up, flip, sort_bars, count_to_bar, size_parity, gravity, move_until_obstacle, odd_one_out
+- dev 4 (적응 방법 고르기만): keep_extreme, centre_dot, majority_colour, ray_until_obstacle
+- **test 7 (판정 한 번)**: remove_noise, remove_border_touching, translate, rotate, recolour_by_size, extend_to_wall, keep_same_shape
+- 시드로 흐름을 분리: 미리 학습 `train-i`, 적응 `adapt-<run>-i`, 평가 `eval-i`. test 가족 과제는 적응 방법을 얼리기 전에는 만들지도, 보지도 않는다.
+
+**모델**: 격자 8장(예시 3쌍 + 시험 입력 + 시험 출력 자리)을 14×14로 채워 1568개 토큰으로 넣는 작은 트랜스포머(수백만 파라미터). 토큰 = 색(0–9 + 격자 밖) + 행 + 열 + 격자 자리. 시험 출력 자리 196칸을 한 번에 예측(격자 밖 칸이 출력 크기를 정함). 구조와 미리 학습 길이는 dev 가족으로만 정한다.
+
+**두 조건** (같은 구조, 같은 적응 방법):
+- 미리 학습: train 17가족 과제로 처음부터 학습 → 새 가족의 과제 N개로 적응.
+- 처음부터: 무작위 초기화 → 같은 N개로 적응.
+
+**측정**: test 가족마다 적응 과제 N개로 미세조정(적응 시드 3개), 새 평가 과제 200개의 시험 출력 정확 일치(격자 전체가 맞아야 정답). 문항마다 3개 시드 평균.
+
+**판정 기준**:
+- **주 가설**: N=32에서 (미리 학습 − 처음부터) 정확 일치 평균 ≥ **+0.10**, 그리고 가족별 층화 부트스트랩(평가 과제 단위, 10000회) 95% 구간 하한 > 0.
+- 보조(보고만): N=8 차이, N=0(적응 없이 예시만 보고 맞히기, 미리 학습 모델만), 가족별 표.
+- **실패하면 2단계에서 멈추고 A(물체 규칙 학습기)로 간다.** 결과는 좋든 나쁘든 그대로 기록.
+
 ## 출처
 
 - TRM: Jolicoeur-Martineau, "Less is More: Recursive Reasoning with Tiny Networks", arXiv 2510.04871 (ARC Prize 2025 논문 부문 1등). 학습 비용은 후속 논문 리뷰(2차 출처) 기준.
