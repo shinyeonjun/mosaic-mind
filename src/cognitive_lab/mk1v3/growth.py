@@ -36,25 +36,39 @@ RESULTS = ROOT / "artifacts" / "results"
 TASK_NAMES = ["ag_news", "emotion", "sst2", "subj", "tweet_sentiment"]
 SYMBOLS = list("ABCDEF")
 L = 6
-ROW_RANGE = {"dev": (0, 160), "sealed": (700, 860)}
+ROW_RANGE = {"dev": (0, 160), "dev2": (160, 320), "sealed": (700, 860)}
+# sealed2 (after the slow split was added): SST-2 is used up, so Rotten Tomatoes MR test (Pang & Lee 2005; SUBJ's
+# subjective sentences also come from Rotten Tomatoes, so the hard same-domain pair stays) replaces it
+SEALED2 = {"ag_news": (860, 1020), "emotion": (860, 1020), "mr": (0, 160), "subj": (860, 1020), "tweet_sentiment": (860, 1020)}
+
+
+def task_rows(task: str) -> list[dict]:
+    """Rows in their fixed shuffled order (the same seeds as mk1v2/taskstream.py; MR loaded here, not added there,
+    so the earlier exams' task order is untouched)."""
+    if task == "mr":
+        import pyarrow.parquet as pq
+
+        rows = [{"text": r["text"], "label": int(r["label"])}
+                for r in pq.read_table(ROOT / "data" / "taskstream" / "rotten_tomatoes_test.parquet").to_pylist()]
+    else:
+        from cognitive_lab.mk1v2.taskstream import _rows
+
+        rows = _rows(task)
+    random.Random(f"taskstream|{task}").shuffle(rows)
+    return rows
 K_EXAMPLES = 16
-SETTINGS = {"W": 5, "kappa": 20.0, "c0": 0.65, "alpha": 0.5, "stay": 2.0, "beta": 12.0}
+SETTINGS = {"W": 5, "kappa": 20.0, "c0": 0.65, "alpha": 0.5, "stay": 2.0, "beta": 12.0, "W2": 15}  # W2: slow split
 
 
 def stream(part: str) -> list[dict]:
-    from cognitive_lab.mk1v2.taskstream import _rows
-
-    lo, hi = ROW_RANGE[part]
-    rows = {}
-    for t in TASK_NAMES:
-        r = _rows(t)
-        random.Random(f"taskstream|{t}").shuffle(r)
-        rows[t] = r[lo:hi]
+    ranges = SEALED2 if part == "sealed2" else {t: ROW_RANGE[part] for t in TASK_NAMES}
+    names = list(ranges)
+    rows = {t: task_rows(t)[lo:hi] for t, (lo, hi) in ranges.items()}
     rng = random.Random(f"growth-blocks|{part}")
-    pos = {t: 0 for t in TASK_NAMES}
+    pos = {t: 0 for t in names}
     out, prev, block = [], None, 0
-    while any(pos[t] < len(rows[t]) for t in TASK_NAMES):
-        live = [t for t in TASK_NAMES if pos[t] < len(rows[t]) and t != prev] or [t for t in TASK_NAMES if pos[t] < len(rows[t])]
+    while any(pos[t] < len(rows[t]) for t in names):
+        live = [t for t in names if pos[t] < len(rows[t]) and t != prev] or [t for t in names if pos[t] < len(rows[t])]
         t = rng.choice(live)
         n = min(rng.randint(20, 60), len(rows[t]) - pos[t])
         for _ in range(n):
@@ -101,6 +115,7 @@ class Grower:
         self.dim = dim
         self.parts, self.usage, self.cur = [Part(dim)], [0.0], 0
         self.window: list[tuple[torch.Tensor, int, bool]] = []  # (vector, label, current part was right)
+        self.long: list[tuple[torch.Tensor, int, float]] = []    # (vector, label, P(label) the current part gave live)
         self.grown = 0
 
     def look(self, part: Part, items) -> float:
@@ -115,10 +130,14 @@ class Grower:
     def feedback(self, v: torch.Tensor, y: int, part_right: bool) -> None:
         cfg = self.cfg
         part = self.parts[self.cur]
+        if cfg.get("W2"):
+            self.long = (self.long + [(v, y, float(part.probs(v, cfg["beta"])[y]))])[-cfg["W2"]:]
         part.learn(v, y)
+        if cfg.get("W2") and len(self.long) == cfg["W2"] and cfg.get("grow", True) and self._split():
+            return
         self.usage[self.cur] += 1
         self.window = (self.window + [(v, y, part_right)])[-cfg["W"]:]
-        if len(self.window) < cfg["W"] or not cfg.get("grow", True):
+        if len(self.window) < cfg.get("min_window", cfg["W"]) or not cfg.get("grow", True):
             return
         tot = sum(self.usage)
         best_j = self.cur
@@ -139,10 +158,31 @@ class Grower:
             self._take_back()
             self.parts.append(fresh)
             self.usage.append(float(fresh.n))
-            self.cur, self.window, self.grown = len(self.parts) - 1, [], self.grown + 1
+            self.cur, self.window, self.long, self.grown = len(self.parts) - 1, [], [], self.grown + 1
         elif best_j != self.cur:
             self._take_back(to=best_j)
-            self.cur, self.window = best_j, []
+            self.cur, self.window, self.long = best_j, [], []
+
+    def _split(self) -> bool:
+        """Slow test, feedback only: were the last W2 items a different context from the part's older items?
+        Old part: the probabilities it gave live (honest). New: a fresh part learning prequentially over them."""
+        cfg = self.cfg
+        tot = sum(self.usage)
+        old = math.log(self.usage[self.cur] / (tot + cfg["alpha"])) + cfg["stay"] + sum(math.log(max(q, 1e-6)) for _, _, q in self.long)
+        fresh, ll = Part(self.dim), 0.0
+        for x, yy, _ in self.long:
+            ll += math.log(float(fresh.probs(x, cfg["beta"])[yy]))
+            fresh.learn(x, yy)
+        if math.log(cfg["alpha"] / (tot + cfg["alpha"])) + ll <= old:
+            return False
+        part = self.parts[self.cur]
+        for x, yy, _ in self.long:
+            part.learn(x, yy, sign=-1.0)
+            self.usage[self.cur] -= 1
+        self.parts.append(fresh)
+        self.usage.append(float(fresh.n))
+        self.cur, self.window, self.long, self.grown = len(self.parts) - 1, [], [], self.grown + 1
+        return True
 
     def _take_back(self, to: int | None = None) -> None:
         """The window's items belonged to the new context: remove them from the part that learned them during the
@@ -291,14 +331,14 @@ def compare(part: str) -> dict:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Self-growth stream (no task ids)")
     parser.add_argument("--system", choices=("growth", "mk1", "mk1-fixed", "one", "oracle", "e2b", "e4b"))
-    parser.add_argument("--set", choices=("dev", "sealed"), default="dev")
+    parser.add_argument("--set", choices=("dev", "dev2", "sealed", "sealed2"), default="dev")
     parser.add_argument("--final", action="store_true")
     parser.add_argument("--compare", action="store_true")
     args = parser.parse_args()
     if args.compare:
         compare(args.set)
         return
-    if args.set == "sealed" and not args.final:
+    if args.set.startswith("sealed") and not args.final:
         raise SystemExit("sealed: pass --final, once per system, after the pre-registration commit")
     out = run(args.system, args.set)
     path = RESULTS / f"mk1v3-growth_{args.system}_{args.set}.json"
