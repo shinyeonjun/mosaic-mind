@@ -418,7 +418,36 @@ def _safe(f, g):
     return np.ascontiguousarray(out)
 
 
-def compose(train, tests, depth=3, budget=10.0, want=2):
+def library_primitives(library: dict | None) -> dict:
+    """The primitives in search order. Without a library: the hand-made order (as frozen for ARC-AGI-1). With one:
+    learned macros first (compositions of primitives, named "a+b"), then primitives by how often they solved tasks."""
+    if not library:
+        return PRIMITIVES
+    out = {}
+    for parts in library.get("macros", []):
+        fs = [PRIMITIVES[q] for q in parts]
+
+        def macro(g, fs=fs):
+            for f in fs:
+                g = f(g)
+                if g is None:
+                    return None
+            return g
+        out["+".join(parts)] = macro
+    for name in library.get("order", []):
+        if name in PRIMITIVES:
+            out[name] = PRIMITIVES[name]
+    for name, f in PRIMITIVES.items():
+        out.setdefault(name, f)
+    return out
+
+
+def expand(program: tuple) -> list[str]:
+    """A program's primitive names with macros unfolded (for learning from it)."""
+    return [q for step in program for q in step.split("+") if q in PRIMITIVES]
+
+
+def compose(train, tests, depth=3, budget=10.0, want=2, prims=None):
     """Programs (tuples of primitive names) consistent with every demonstration, shortest first, with their test
     outputs; up to `want` distinct test answers."""
     started = time.perf_counter()
@@ -447,7 +476,7 @@ def compose(train, tests, depth=3, budget=10.0, want=2):
     for _ in range(depth):
         nxt = []
         for prog, grids in frontier:
-            for name, f in PRIMITIVES.items():
+            for name, f in (prims or PRIMITIVES).items():
                 if time.perf_counter() - started > budget or len(answers) >= want:
                     return answers
                 out = [_safe(f, g) for g in grids]
@@ -505,11 +534,11 @@ def local_rule(train, tests):
     return []
 
 
-def solve(task: dict, budget: float = 10.0) -> list[tuple]:
+def solve(task: dict, budget: float = 10.0, library: dict | None = None) -> list[tuple]:
     """Up to two (program, test outputs) answers; empty = "I don't know"."""
     train = [(p["input"], p["output"]) for p in task["train"]]
     tests = [p["input"] for p in task["test"]]
-    answers = compose(train, tests, budget=budget)
+    answers = compose(train, tests, budget=budget, prims=library_primitives(library) if library else None)
     for a in local_rule(train, tests):
         if a[1] not in [b for _, b in answers]:
             answers.append(a)
