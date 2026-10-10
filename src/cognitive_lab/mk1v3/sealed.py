@@ -43,7 +43,7 @@ def musique_items() -> list[dict]:
             rng.shuffle(others)
             docs = support + others[:PASSAGES - len(support)]
             rng.shuffle(docs)
-            items.append({"id": f"musique|{qid}|{'answerable' if row['answerable'] else 'unanswerable'}",
+            items.append({"id": f"musique|{qid}|{'answerable' if row['answerable'] else 'unanswerable'}", "source": "musique",
                           "query": row["question"], "answers": [row["answer"]] + row.get("answer_aliases", []),
                           "answerable": row["answerable"], "docs": [f"{p['title']}: {p['paragraph_text']}" for p in docs]})
     return items
@@ -202,4 +202,5 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
 
