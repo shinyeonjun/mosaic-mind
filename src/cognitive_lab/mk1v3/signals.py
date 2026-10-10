@@ -117,7 +117,7 @@ class Recorder:
         self.selector = Selector(device)
 
     def _chat(self, messages, max_tokens, temperature, logprobs=False, seed=0):
-        body = {"messages": messages, "max_tokens": max_tokens, "temperature": temperature, "seed": seed,
+        body = {"messages": messages, "max_tokens": max_tokens, "temperature": temperature, "seed": seed, "cache_prompt": False,
                 "chat_template_kwargs": {"enable_thinking": False}}
         if logprobs:
             body.update({"logprobs": True, "top_logprobs": 2})
