@@ -90,7 +90,8 @@ def main() -> None:
             seconds[key] += board.cost()
             if n % 200 == 0:
                 print(f"  {n}/{len(stream)} ({(time.perf_counter() - started) / 60:.0f} min)", flush=True)
-    reference = {"rgb": 0.8077, "musique": 0.59, "arc": 0.25, "taskstream|named": 0.715, "taskstream|symbolic": 0.6883}
+    reference = {"rgb": 0.80, "musique": 0.58,  # per-exam v3 dev after the cache-off re-recording (exam_check)
+                  "arc": 0.25, "taskstream|named": 0.715, "taskstream|symbolic": 0.6883}
     out = {k: {"n": len(v), "score": round(statistics.mean(v), 4), "per_exam_reference": reference[k],
                "speaker_calls_per_input": round(statistics.mean(calls[k]), 3), "seconds": round(seconds[k], 1)}
            for k, v in scores.items()}
@@ -100,3 +101,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
