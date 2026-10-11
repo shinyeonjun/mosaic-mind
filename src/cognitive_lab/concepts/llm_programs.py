@@ -144,7 +144,10 @@ def run():
 
 
 def report():
-    rows = [json.loads(l) for l in OUT.read_text().splitlines()]
+    rows = {}
+    for r in map(json.loads, OUT.read_text().splitlines()):
+        rows.setdefault(r["task"], r)  # a task written twice (two runs at once on 2026-10-12): the first row counts
+    rows = list(rows.values())
     solved = sum(r["score"] > 0 for r in rows)
     answered = [r for r in rows if r["answered"]]
     prec = sum(r["score"] > 0 for r in answered) / len(answered) if answered else float("nan")
