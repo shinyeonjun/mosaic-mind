@@ -22,8 +22,8 @@ MODELS = {
 
 
 class LLMService:
-    def __init__(self, name: str, port: int = 8081, context: int = 8192, log: Path | None = None):
-        self.name, self.port, self.context = name, port, context
+    def __init__(self, name: str, port: int = 8081, context: int = 8192, log: Path | None = None, parallel: int = 1):
+        self.name, self.port, self.context, self.parallel = name, port, context, parallel
         self.url = f"http://127.0.0.1:{port}"
         self.log = log or ROOT / "artifacts" / "logs" / f"llama-server-{name}.log"
         self.process = None
@@ -34,7 +34,7 @@ class LLMService:
     def __enter__(self):
         self.log.parent.mkdir(parents=True, exist_ok=True)
         self.process = subprocess.Popen([str(SERVER), "-m", str(MODELS[self.name]), "-ngl", "999", "-c", str(self.context),
-                                         "--port", str(self.port), "--host", "127.0.0.1", "-np", "1"],
+                                         "--port", str(self.port), "--host", "127.0.0.1", "-np", str(self.parallel)],
                                         stdout=self.log.open("w"), stderr=subprocess.STDOUT)
         for _ in range(120):
             try:
@@ -50,8 +50,9 @@ class LLMService:
             self.process.terminate()
             self.process.wait(timeout=30)
 
-    def chat(self, messages: list[dict], max_tokens: int = 256, temperature: float = 0.0, schema: dict | None = None) -> str:
-        body = {"messages": messages, "temperature": temperature, "max_tokens": max_tokens, "seed": 0, "cache_prompt": False,
+    def chat(self, messages: list[dict], max_tokens: int = 256, temperature: float = 0.0, schema: dict | None = None,
+             seed: int = 0) -> str:
+        body = {"messages": messages, "temperature": temperature, "max_tokens": max_tokens, "seed": seed, "cache_prompt": False,
                 "chat_template_kwargs": {"enable_thinking": False}}
         if schema is not None:
             body["response_format"] = {"type": "json_schema", "json_schema": {"name": "out", "schema": schema}}
