@@ -667,7 +667,11 @@ FAMILIES = {
 def task(family: str, seed) -> dict | None:
     """One task of a family: 3 demonstrations and 1 test pair sharing the task's parameters."""
     rng = random.Random(f"{family}|{seed}")
-    make = FAMILIES[family][1](rng)
+    if family in FAMILIES:
+        make = FAMILIES[family][1](rng)
+    else:  # the probe families live in their own module (written after the 28 were all used for training)
+        from cognitive_lab.concepts.probe_families import PROBE
+        make = PROBE[family][1](rng)
     pairs = []
     for _ in range(60):
         p = make()

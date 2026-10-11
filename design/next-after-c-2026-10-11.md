@@ -51,3 +51,14 @@
 
 - 가족 수에 따른 기울기가 있어도, 합성 가족에서 사람이 만든 과제로 옮겨지는 정도는 따로다(3단계에서 본 차이).
 - 새 가족 8개는 우리가 쓰는 것이라, 우리가 만든 가족끼리 닮을 수 있다(평가가 쉬워질 위험). 그래서 마지막 판단은 언제나 사람이 만든 봉인 시험(ConceptARC)으로 한다.
+
+## 6. 탐침 사전 등록 (2026-10-11, 학습 전에 커밋)
+
+- **새 시험 가족 8개** (`src/cognitive_lab/concepts/probe_families.py`): swap_colours, mark_corners, copy_shape_to_markers, bounding_box, invert_colours, pattern_continue, draw_diagonal, cross_from_dot. 28가족을 전부 학습에 쓴 뒤 핵심 지식 목록에서 새로 썼다(ConceptARC 안 봄). 생성 유효성 8가족 모두 30/30. 예시를 눈으로 확인했다.
+- **미리 학습 모델 3개** (`src/cognitive_lab/concepts/probe.py`): 2단계와 같은 구조(2.68M), 같은 학습(20000스텝, 처음부터, 회전 없음, 색 바꾸기·예시 순서 섞기). 다른 것은 가족 수뿐이다. 가족 7 / 14 / 28은 그룹을 돌아가며 뽑아 겹쳐 포함된다(시드 고정, 목록은 `probe subsets` 출력).
+  - 7: move_until_obstacle, keep_same_shape, flip, sort_bars, fill_holes, ray_until_obstacle, odd_one_out
+  - 14: 위 7 + rotate, majority_colour, keep_extreme, gravity, mirror_complete, size_parity, remove_border_touching
+  - 28: 전부
+- **측정**: 새 가족마다 평가 과제 200개, 정확 일치. N=0(예시만), N=8(과제 8개로 적응, 2단계에서 얼린 1500스텝, 적응 시드 2개 평균). 참고로 처음부터 모델 N=8도 잰다.
+- **판단 규칙**: N=8에서 (28가족 − 14가족) ≥ **+0.05**이고 부트스트랩(평가 과제 단위, 가족별) 95% 하한 > 0이면 **B로 간다**(생성기 확장 + 긴 학습). 아니면 B를 닫고 **A(검증 고치기) → 4단계**로 C 경로를 마무리한다.
+- 알려진 혼동: 스텝 수가 같으므로 가족이 많을수록 가족당 학습량은 적다. 실제로 쓸 때의 선택(같은 계산으로 넓게 vs 깊게)과 같은 조건이라 그대로 둔다.
