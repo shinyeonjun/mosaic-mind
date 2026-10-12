@@ -163,14 +163,16 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Record satellite signals for calibration (not on exams)")
     parser.add_argument("--per-source", type=int, default=300)
     parser.add_argument("--musique-train", type=int, default=0, help="also record this many MuSiQue train questions")
+    parser.add_argument("--speaker", choices=("e2b", "e4b"), default="e2b", help="e4b: MK1 v4 (its own file)")
     args = parser.parse_args()
+    out = OUT if args.speaker == "e2b" else OUT.with_name("mk1v4-calibration-signals.jsonl")
     items = squad_items(args.per_source) + hotpot_items(args.per_source) + musique_train_items(args.musique_train)
-    done = {json.loads(l)["id"] for l in OUT.read_text(encoding="utf-8").splitlines()} if OUT.exists() else set()
+    done = {json.loads(l)["id"] for l in out.read_text(encoding="utf-8").splitlines()} if out.exists() else set()
     todo = [it for it in items if it["id"] not in done]
     print(f"{len(items)} questions, {len(done)} already recorded, {len(todo)} to go", flush=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     started = time.perf_counter()
-    with LLMService("e2b") as llm, OUT.open("a", encoding="utf-8") as log:
+    with LLMService(args.speaker) as llm, out.open("a", encoding="utf-8") as log:
         rec = Recorder(llm, device)
         for n, it in enumerate(todo, 1):
             log.write(json.dumps(rec.record(it), ensure_ascii=False) + "\n")
@@ -178,7 +180,7 @@ def main() -> None:
             if n % 25 == 0:
                 rate = n / (time.perf_counter() - started)
                 print(f"  {n}/{len(todo)} ({(len(todo) - n) / rate / 60:.0f} min left)", flush=True)
-    print("Saved:", OUT)
+    print("Saved:", out)
 
 
 if __name__ == "__main__":
