@@ -122,9 +122,9 @@ def run(system: str) -> dict:
         for n, (exam, item, truth) in enumerate(items(), 1):
             key = f"taskstream|{item['condition']}" if exam == "taskstream" else exam
             t = time.perf_counter()
+            calls_before = llm.calls
             if mk1 is not None:
                 board = mk1.solve(item)
-                calls = sum(w == "speaker" for w in board.calls())
                 if exam in ("rgb", "musique"):
                     score = doc_net(board, item)
                 elif exam == "arc":
@@ -133,7 +133,7 @@ def run(system: str) -> dict:
                     score = int(board.read("answer") == truth)
                     mk1.feedback(board, truth)
             else:
-                out, calls = alone(llm, exam, item, recent)
+                out, _ = alone(llm, exam, item, recent)
                 if exam in ("rgb", "musique"):
                     score = doc_net(Reply(out), item)
                 elif exam == "arc":
@@ -141,6 +141,7 @@ def run(system: str) -> dict:
                 else:
                     score = int(out == truth)
                     recent.setdefault("/".join(item["labels"]), []).append((item["text"], truth))
+            calls = llm.calls - calls_before  # every HTTP call to the speaker (v3's recorder makes 1 + 3 samples)
             rows.append({"key": key, "seconds": round(time.perf_counter() - t, 3), "speaker_calls": calls, "score": score})
             if n % 20 == 0:
                 print(f"  {n} items, {(time.perf_counter() - started) / 60:.1f} min, peak {vram.peak} MiB", flush=True)

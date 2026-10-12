@@ -123,6 +123,7 @@ class Recorder:
             body.update({"logprobs": True, "top_logprobs": 2})
         req = urllib.request.Request(self.llm.url + "/v1/chat/completions", data=json.dumps(body).encode(),
                                      headers={"Content-Type": "application/json"})
+        self.llm.calls += 1  # counted with the service's own calls (efficiency.py reads this)
         return json.load(urllib.request.urlopen(req, timeout=300))["choices"][0]
 
     def record(self, item: dict) -> dict:
