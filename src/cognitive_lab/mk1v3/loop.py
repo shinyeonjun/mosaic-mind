@@ -27,7 +27,7 @@ import time
 import numpy as np
 import torch
 
-from cognitive_lab.mk1v3.calibrate import FEATURES, WEIGHTS, Logistic
+from cognitive_lab.mk1v3.calibrate import FEATURES, LEAN, WEIGHTS, WEIGHTS_LEAN, Logistic
 
 REJECT = "I can not answer the question because of the insufficient information in documents."
 CHEAP_FEATURES = ["reader_margin", "chain1", "chain2"]
@@ -88,10 +88,15 @@ class LabelPart:
 
 
 class MK1v3:
-    def __init__(self, llm, device: torch.device):
+    def __init__(self, llm, device: torch.device, lean: bool = True, half: bool = True):
+        """lean: calibrators without the 3 confidence samples (1 speaker call per document question instead of 4);
+        half: satellite weights in float16. Both on since 2026-10-12 (design/antiques-rethink-2026-10-12.md, 9);
+        lean=False, half=False reproduces the v3 of the sealed exams."""
         self.llm, self.device = llm, device
-        saved = json.loads(WEIGHTS.read_text(encoding="utf-8"))
-        self.models = {h: Logistic.from_dict(saved["models"][h]) for h in FEATURES}
+        self.lean, self.half = lean, half
+        self.features = LEAN if lean else FEATURES
+        saved = json.loads((WEIGHTS_LEAN if lean else WEIGHTS).read_text(encoding="utf-8"))
+        self.models = {h: Logistic.from_dict(saved["models"][h]) for h in self.features}
         self.cheap = None
         self._recorder = self._embed = None
         self.parts: dict[str, LabelPart] = {}
@@ -102,14 +107,14 @@ class MK1v3:
         if self._recorder is None:
             from cognitive_lab.mk1v3.signals import Recorder
 
-            self._recorder = Recorder(self.llm, self.device)
+            self._recorder = Recorder(self.llm, self.device, half=self.half)
         return self._recorder
 
     def embed(self):
         if self._embed is None:
             from cognitive_lab.mk1v2.taskstream import Embedder
 
-            self._embed = Embedder(self.device, "bge-large")
+            self._embed = Embedder(self.device, "bge-large", dtype=torch.float16 if self.half else None)
         return self._embed
 
     def cheap_model(self):
@@ -147,18 +152,18 @@ class MK1v3:
             board.write("reply", REJECT, "speaker-skipped")
             return
         t = time.perf_counter()
-        signals = rec.record(item)  # the speaker with log-probabilities and samples (re-reads documents; cheap)
+        signals = rec.record(item, samples=0 if self.lean else 3)  # the speaker with log-probabilities (re-reads documents; cheap)
         board.write("signals", signals, "speaker", time.perf_counter() - t)
         signals["rejected"] = float(signals["rejected"])
         from cognitive_lab.mk1v3.calibrate import matrix
 
-        p_ans = float(self.models["answerable"].predict(matrix([signals], "answerable")[0])[0])
+        p_ans = float(self.models["answerable"].predict(matrix([signals], "answerable", self.features)[0])[0])
         board.write("p_answerable", p_ans, "calibrator")
         if signals["rejected"]:
             board.write("decision", "reject", "decide")
             board.write("reply", signals["reply"], "speaker")
             return
-        p_right = float(self.models["right"].predict(matrix([signals], "right")[0])[0])
+        p_right = float(self.models["right"].predict(matrix([signals], "right", self.features)[0])[0])
         board.write("p_right", p_right, "calibrator")
         answer = 2 * p_right - 1 > 1 - p_ans
         board.write("decision", "answer" if answer else "reject", "decide")

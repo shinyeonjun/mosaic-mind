@@ -65,7 +65,7 @@ def pairs(q: dict, rng: random.Random, negatives: int = 4) -> list[tuple[str, st
 
 
 class Selector:
-    def __init__(self, device: torch.device, checkpoint=CHECKPOINT):
+    def __init__(self, device: torch.device, checkpoint=CHECKPOINT, dtype=torch.float32):
         from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
         self.device = device
@@ -76,7 +76,7 @@ class Selector:
                                                                         dtype=torch.float32)
         if checkpoint is not None:
             self.model.load_state_dict(torch.load(checkpoint, map_location="cpu"))
-        self.model.to(device).eval()
+        self.model.to(device=device, dtype=dtype).eval()  # dtype for inference only (bf16 halves the memory)
 
     @torch.no_grad()
     def score(self, firsts: list[str], paragraphs: list[str], batch: int = 16) -> list[float]:

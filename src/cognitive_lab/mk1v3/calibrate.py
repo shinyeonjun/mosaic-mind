@@ -24,6 +24,11 @@ FEATURES = {
               "reader_margin", "reply_has_reader", "chain1", "chain2"],
     "answerable": ["rejected", "lp_mean", "lp_min", "sample_same_choice", "reader_margin", "chain1", "chain2"],
 }
+# Lean heads (2026-10-12): the same without the three temperature-0.8 samples. Dropping them changed nothing on the
+# calibration data (right AUROC 0.773 -> 0.775, answerable 0.882 -> 0.871, cross-source net scores identical) and cuts
+# the speaker's calls per document question from 4 to 1. v3 uses these by default from then on.
+LEAN = {h: [f for f in fs if not f.startswith("sample_")] for h, fs in FEATURES.items()}
+WEIGHTS_LEAN = WEIGHTS.with_name("mk1v3-calibrator-lean.json")
 # Per-document reading features (mk1v3/reader_features.py: docs_positive, margin_second, docs_agree_reply,
 # docs_agree_best) were tried and left out: they did not transfer (RGB dev 0.808 -> 0.739, its answerable AUROC
 # 0.906 -> 0.835; RGB spreads the answer over many news documents, unlike the calibration data).
@@ -76,8 +81,8 @@ class Logistic:
         return m
 
 
-def matrix(rows: list[dict], head: str):
-    X = [[float(r[f]) for f in FEATURES[head]] for r in rows]
+def matrix(rows: list[dict], head: str, features: dict | None = None):
+    X = [[float(r[f]) for f in (features or FEATURES)[head]] for r in rows]
     y = [float(r["right"] if head == "right" else r["answerable"]) for r in rows]
     return np.array(X), np.array(y)
 
@@ -157,13 +162,22 @@ def report(rows: list[dict]) -> dict:
 
 
 def main() -> None:
+    import argparse
+
+    global FEATURES
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--lean", action="store_true", help="the heads without the sample features")
+    args = parser.parse_args()
+    weights, tag = (WEIGHTS_LEAN, "mk1v3-calibrator-lean") if args.lean else (WEIGHTS, "mk1v3-calibrator")
+    if args.lean:
+        FEATURES = LEAN
     rows = merge([json.loads(l) for l in SIGNALS.read_text(encoding="utf-8").splitlines()])
     out = report(rows)
     print(json.dumps(out, indent=1))
     models = {h: Logistic().fit(*matrix(head_rows(rows, h), h)).to_dict() for h in FEATURES}
-    WEIGHTS.write_text(json.dumps({"features": FEATURES, "models": models}), encoding="utf-8")
-    (ROOT / "artifacts" / "results" / "mk1v3-calibrator-report.json").write_text(json.dumps(out, indent=1), encoding="utf-8")
-    print("Saved:", WEIGHTS)
+    weights.write_text(json.dumps({"features": FEATURES, "models": models}), encoding="utf-8")
+    (ROOT / "artifacts" / "results" / f"{tag}-report.json").write_text(json.dumps(out, indent=1), encoding="utf-8")
+    print("Saved:", weights)
 
 
 if __name__ == "__main__":

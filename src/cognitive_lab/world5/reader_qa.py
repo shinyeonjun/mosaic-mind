@@ -96,13 +96,13 @@ def training_features(tokenizer, rows: list[dict]) -> dict[str, torch.Tensor]:
             "start_positions": torch.tensor(starts), "end_positions": torch.tensor(ends)}
 
 
-def load_model(device: torch.device, trained: bool, checkpoint=None):
+def load_model(device: torch.device, trained: bool, checkpoint=None, dtype=torch.float32):
     from transformers import AutoModelForQuestionAnswering
 
     model = AutoModelForQuestionAnswering.from_pretrained(BASE_DIR, dtype=torch.float32)
     if trained:
         model.load_state_dict(torch.load(checkpoint or CHECKPOINT, map_location="cpu"))
-    return model.to(device)
+    return model.to(device=device, dtype=dtype)  # bf16 weights halve the memory; trained in fp32, cast after
 
 
 def train(args, device: torch.device) -> None:
@@ -226,7 +226,7 @@ class Reader:
         self.precise = self.precision == "fp32"
         self.half = {"fp16": torch.float16, "bf16": torch.bfloat16}.get(self.precision)
         self.tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_DIR)
-        self.model = load_model(device, trained=True, checkpoint=checkpoint).eval()
+        self.model = load_model(device, trained=True, checkpoint=checkpoint, dtype=self.half or torch.float32).eval()
 
     @torch.no_grad()
     def spans(self, question: str, context: str, k: int = 1, max_tokens: int = MAX_ANSWER_TOKENS):

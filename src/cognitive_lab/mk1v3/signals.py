@@ -107,14 +107,18 @@ def overlap(a: str, b: str) -> float:
 
 
 class Recorder:
-    def __init__(self, llm, device):
+    def __init__(self, llm, device, half: bool = False):
+        """half: satellite weights in float16 (2026-10-12, memory). fp16, not bf16: on 80 development questions DeBERTa in
+        bf16 moved hop scores by 0.022 on average and changed 2 first-hop choices; fp16 moved them by 0.0025 and changed none."""
+        import torch
+
         from cognitive_lab.mk1v2.reader_en import CHECKPOINT as READER_EN
         from cognitive_lab.mk1v2.selector import Selector
         from cognitive_lab.world5.reader_qa import Reader
 
         self.llm = llm
-        self.reader = Reader(device, checkpoint=READER_EN)
-        self.selector = Selector(device)
+        self.reader = Reader(device, checkpoint=READER_EN, precision="fp16" if half else None)
+        self.selector = Selector(device, dtype=torch.float16 if half else torch.float32)
 
     def _chat(self, messages, max_tokens, temperature, logprobs=False, seed=0):
         body = {"messages": messages, "max_tokens": max_tokens, "temperature": temperature, "seed": seed, "cache_prompt": False,
@@ -126,7 +130,8 @@ class Recorder:
         self.llm.calls += 1  # counted with the service's own calls (efficiency.py reads this)
         return json.load(urllib.request.urlopen(req, timeout=300))["choices"][0]
 
-    def record(self, item: dict) -> dict:
+    def record(self, item: dict, samples: int = 3) -> dict:
+        """samples = 0: no temperature-0.8 samples (the lean heads); their features are then 0."""
         from cognitive_lab.mk1v2.rgb import INSTRUCTION, SYSTEM
 
         messages = [{"role": "system", "content": SYSTEM},
@@ -138,7 +143,7 @@ class Recorder:
         gaps = [t["top_logprobs"][0]["logprob"] - t["top_logprobs"][1]["logprob"] for t in toks
                 if t.get("token") and len(t.get("top_logprobs", [])) > 1]
         rejected = "insufficient information" in reply
-        samples = [self._chat(messages, 60, 0.8, seed=s + 1)["message"]["content"] for s in range(3)]
+        samples = [self._chat(messages, 60, 0.8, seed=s + 1)["message"]["content"] for s in range(samples)]
         reads = self.reader.read_many([(item["query"], d) for d in item["docs"]])
         best = max(reads, key=lambda r: r["span_score"] - r["null_score"])
         chain = self.selector.chain(item["query"], item["docs"], hops=2)
@@ -148,8 +153,8 @@ class Recorder:
             "right": right, "rejected": rejected,
             "lp_mean": statistics.mean(lps) if lps else 0.0, "lp_min": min(lps) if lps else 0.0,
             "lp_first": lps[0] if lps else 0.0, "gap_mean": statistics.mean(gaps) if gaps else 0.0, "length": len(lps),
-            "sample_same_choice": statistics.mean(float(("insufficient information" in s) == rejected) for s in samples),
-            "sample_overlap": statistics.mean(overlap(reply, s) for s in samples),
+            "sample_same_choice": statistics.mean(float(("insufficient information" in s) == rejected) for s in samples) if samples else 0.0,
+            "sample_overlap": statistics.mean(overlap(reply, s) for s in samples) if samples else 0.0,
             "reader_margin": best["span_score"] - best["null_score"], "reader_answer": best["answer"],
             "reply_has_reader": float(bool(best["answer"]) and best["answer"].lower() in reply.lower()),
             "chain1": chain[0][1], "chain2": chain[1][1] if len(chain) > 1 else 0.0,

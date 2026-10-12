@@ -158,11 +158,11 @@ def run(system: str) -> dict:
 
 
 def compare() -> None:
-    res = {s: json.loads((RESULTS / f"efficiency_{s}.json").read_text(encoding="utf-8"))
-           for s in ("v3", "e2b", "e4b") if (RESULTS / f"efficiency_{s}.json").exists()}
+    res = {p.stem[len("efficiency_"):]: json.loads(p.read_text(encoding="utf-8"))
+           for p in sorted(RESULTS.glob("efficiency_*.json")) if p.stem != "efficiency_compare"}
     print("system   after-server MiB   peak MiB")
     for s, r in res.items():
-        print(f"{s:6s}   {r['vram_mib']['after_server']:>14}   {r['vram_mib']['peak']:>8}")
+        print(f"{s:16s}   {r['vram_mib']['after_server']:>14}   {r['vram_mib']['peak']:>8}")
     kinds = sorted({k for r in res.values() for k in r["by_kind"]})
     print("\nkind                  " + "".join(f"{s:>22s}" for s in res))
     for k in kinds:

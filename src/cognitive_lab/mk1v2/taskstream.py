@@ -101,7 +101,7 @@ EYES = {"e5-small": "multilingual-e5-small", "bge-large": "bge-large-en-v1.5"}
 class Embedder:
     """e5-small: mean pooling with the "query: " prefix; bge-large: the CLS vector, no prefix (BGE's own usage)."""
 
-    def __init__(self, device, eye: str = "e5-small"):
+    def __init__(self, device, eye: str = "e5-small", dtype=None):
         import torch
         from transformers import AutoModel, AutoTokenizer
 
@@ -110,6 +110,8 @@ class Embedder:
         directory = ROOT / "model" / EYES[eye]
         self.tokenizer = AutoTokenizer.from_pretrained(directory)
         self.model = AutoModel.from_pretrained(directory).to(device).eval()
+        if dtype is not None:  # bf16 weights halve the memory (2026-10-12); vectors come back in float32
+            self.model.to(dtype)
 
     def __call__(self, texts: list[str]):
         torch = self.torch
@@ -119,7 +121,7 @@ class Embedder:
                 chunk = texts[b:b + 32] if self.eye == "bge-large" else ["query: " + t for t in texts[b:b + 32]]
                 x = self.tokenizer(chunk, padding=True, truncation=True, max_length=256 if self.eye == "bge-large" else 128,
                                    return_tensors="pt").to(self.device)
-                h = self.model(**x).last_hidden_state
+                h = self.model(**x).last_hidden_state.float()
                 e = h[:, 0] if self.eye == "bge-large" else (h * x["attention_mask"][..., None]).sum(1) / x["attention_mask"].sum(1, keepdim=True)
                 out.append(torch.nn.functional.normalize(e, dim=-1).cpu())
             return torch.cat(out)
