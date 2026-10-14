@@ -29,6 +29,10 @@ FEATURES = {
 # the speaker's calls per document question from 4 to 1. v3 uses these by default from then on.
 LEAN = {h: [f for f in fs if not f.startswith("sample_")] for h, fs in FEATURES.items()}
 WEIGHTS_LEAN = WEIGHTS.with_name("mk1v3-calibrator-lean.json")
+# Without the hop selector (2026-10-13): on development the reader alone gave the same decisions as reader + selector
+# (design/antiques-rethink-2026-10-12.md, 11), and the selector costs 0.56 GB and 0.08 s per question.
+NOSEL = {h: [f for f in fs if f not in ("chain1", "chain2")] for h, fs in LEAN.items()}
+WEIGHTS_NOSEL = WEIGHTS.with_name("mk1v3-calibrator-lean-nosel.json")
 # Per-document reading features (mk1v3/reader_features.py: docs_positive, margin_second, docs_agree_reply,
 # docs_agree_best) were tried and left out: they did not transfer (RGB dev 0.808 -> 0.739, its answerable AUROC
 # 0.906 -> 0.835; RGB spreads the answer over many news documents, unlike the calibration data).
@@ -167,10 +171,13 @@ def main() -> None:
     global FEATURES
     parser = argparse.ArgumentParser()
     parser.add_argument("--lean", action="store_true", help="the heads without the sample features")
+    parser.add_argument("--nosel", action="store_true", help="lean and without the selector's features")
     args = parser.parse_args()
     weights, tag = (WEIGHTS_LEAN, "mk1v3-calibrator-lean") if args.lean else (WEIGHTS, "mk1v3-calibrator")
     if args.lean:
         FEATURES = LEAN
+    if args.nosel:
+        FEATURES, weights, tag = NOSEL, WEIGHTS_NOSEL, "mk1v3-calibrator-lean-nosel"
     rows = merge([json.loads(l) for l in SIGNALS.read_text(encoding="utf-8").splitlines()])
     out = report(rows)
     print(json.dumps(out, indent=1))

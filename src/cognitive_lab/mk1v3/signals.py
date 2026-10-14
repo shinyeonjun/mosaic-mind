@@ -107,7 +107,7 @@ def overlap(a: str, b: str) -> float:
 
 
 class Recorder:
-    def __init__(self, llm, device, half: bool = False):
+    def __init__(self, llm, device, half: bool = False, selector: bool = True):
         """half: satellite weights in float16 (2026-10-12, memory). fp16, not bf16: on 80 development questions DeBERTa in
         bf16 moved hop scores by 0.022 on average and changed 2 first-hop choices; fp16 moved them by 0.0025 and changed none."""
         import torch
@@ -118,7 +118,7 @@ class Recorder:
 
         self.llm = llm
         self.reader = Reader(device, checkpoint=READER_EN, precision="fp16" if half else None)
-        self.selector = Selector(device, dtype=torch.float16 if half else torch.float32)
+        self.selector = Selector(device, dtype=torch.float16 if half else torch.float32) if selector else None
 
     def _chat(self, messages, max_tokens, temperature, logprobs=False, seed=0):
         body = {"messages": messages, "max_tokens": max_tokens, "temperature": temperature, "seed": seed, "cache_prompt": False,
@@ -146,7 +146,7 @@ class Recorder:
         samples = [self._chat(messages, 60, 0.8, seed=s + 1)["message"]["content"] for s in range(samples)]
         reads = self.reader.read_many([(item["query"], d) for d in item["docs"]])
         best = max(reads, key=lambda r: r["span_score"] - r["null_score"])
-        chain = self.selector.chain(item["query"], item["docs"], hops=2)
+        chain = self.selector.chain(item["query"], item["docs"], hops=2) if self.selector is not None else [(0, 0.0)]
         right = (not rejected) and any(a.lower() in reply.lower() for a in item["answers"] if a)
         return {
             "id": item["id"], "source": item["source"], "answerable": item["answerable"], "reply": reply,

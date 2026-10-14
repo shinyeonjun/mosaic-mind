@@ -27,7 +27,7 @@ import time
 import numpy as np
 import torch
 
-from cognitive_lab.mk1v3.calibrate import FEATURES, LEAN, WEIGHTS, WEIGHTS_LEAN, Logistic
+from cognitive_lab.mk1v3.calibrate import FEATURES, LEAN, NOSEL, WEIGHTS, WEIGHTS_LEAN, WEIGHTS_NOSEL, Logistic
 
 REJECT = "I can not answer the question because of the insufficient information in documents."
 CHEAP_FEATURES = ["reader_margin", "chain1", "chain2"]
@@ -88,14 +88,18 @@ class LabelPart:
 
 
 class MK1v3:
-    def __init__(self, llm, device: torch.device, lean: bool = True, half: bool = True):
+    def __init__(self, llm, device: torch.device, lean: bool = True, half: bool = True, selector: bool = False,
+                 offload: bool = True):
         """lean: calibrators without the 3 confidence samples (1 speaker call per document question instead of 4);
-        half: satellite weights in float16. Both on since 2026-10-12 (design/antiques-rethink-2026-10-12.md, 9);
-        lean=False, half=False reproduces the v3 of the sealed exams."""
+        half: satellite weights in float16 (both since 2026-10-12, design/antiques-rethink-2026-10-12.md, 9-10);
+        selector: the hop selector (off since 2026-10-13: no gain on development, 11); offload: only the satellites
+        of the current input's kind stay on the GPU, the others wait in CPU memory (12).
+        lean=False, half=False, selector=True, offload=False reproduces the v3 of the sealed exams."""
         self.llm, self.device = llm, device
-        self.lean, self.half = lean, half
-        self.features = LEAN if lean else FEATURES
-        saved = json.loads((WEIGHTS_LEAN if lean else WEIGHTS).read_text(encoding="utf-8"))
+        self.lean, self.half, self.selector, self.offload = lean, half, selector, offload
+        self.features = (LEAN if selector else NOSEL) if lean else FEATURES
+        weights = (WEIGHTS_LEAN if selector else WEIGHTS_NOSEL) if lean else WEIGHTS
+        saved = json.loads(weights.read_text(encoding="utf-8"))
         self.models = {h: Logistic.from_dict(saved["models"][h]) for h in self.features}
         self.cheap = None
         self._recorder = self._embed = None
@@ -107,7 +111,7 @@ class MK1v3:
         if self._recorder is None:
             from cognitive_lab.mk1v3.signals import Recorder
 
-            self._recorder = Recorder(self.llm, self.device, half=self.half)
+            self._recorder = Recorder(self.llm, self.device, half=self.half, selector=self.selector)
         return self._recorder
 
     def embed(self):
@@ -123,15 +127,43 @@ class MK1v3:
             from cognitive_lab.mk1v3.calibrate import SIGNALS, merge
 
             rows = merge([json.loads(l) for l in SIGNALS.read_text(encoding="utf-8").splitlines()])
-            X = np.array([[r[f] for f in CHEAP_FEATURES] for r in rows])
+            X = np.array([[r[f] for f in self.cheap_features()] for r in rows])
             self.cheap = Logistic().fit(X, np.array([float(r["answerable"]) for r in rows]))
         return self.cheap
+
+    def cheap_features(self) -> list[str]:
+        return CHEAP_FEATURES if self.selector else ["reader_margin"]
+
+    def place(self, k: str) -> None:
+        """Offload: the satellites this kind uses go to the GPU, the rest to CPU memory (weights kept, no reload)."""
+        if not self.offload:
+            return
+        mods = {"documents": [], "label": []}
+        if self._recorder is not None:
+            mods["documents"].append(self._recorder.reader.model)
+            if self._recorder.selector is not None:
+                mods["documents"].append(self._recorder.selector.model)
+        if self._embed is not None:
+            mods["label"].append(self._embed.model)
+        moved = False
+        for kk, ms in mods.items():
+            for m in ms:
+                target = self.device if kk == k else torch.device("cpu")
+                if next(m.parameters()).device != target:
+                    m.to(target)
+                    moved = True
+        if moved:
+            torch.cuda.empty_cache()
 
     # ---------- the loop ----------
     def solve(self, item: dict) -> Board:
         board = Board(item)
         k = kind(item)
         board.write("kind", k, "form")
+        t = time.perf_counter()
+        self.place(k)
+        if self.offload:
+            board.write("placed", k, "offload", time.perf_counter() - t)
         getattr(self, f"_{k}")(board, item)
         return board
 
@@ -141,10 +173,12 @@ class MK1v3:
         reads = rec.reader.read_many([(item["query"], d) for d in item["docs"]])
         best = max(reads, key=lambda r: r["span_score"] - r["null_score"])
         board.write("reader", {"answer": best["answer"], "margin": best["span_score"] - best["null_score"]}, "reader", time.perf_counter() - t)
-        t = time.perf_counter()
-        chain = rec.selector.chain(item["query"], item["docs"], hops=2)
-        board.write("chain", [c for _, c in chain], "selector", time.perf_counter() - t)
-        cheap = [board.read("reader")["margin"], chain[0][1], chain[1][1] if len(chain) > 1 else 0.0]
+        cheap = [board.read("reader")["margin"]]
+        if self.selector:
+            t = time.perf_counter()
+            chain = rec.selector.chain(item["query"], item["docs"], hops=2)
+            board.write("chain", [c for _, c in chain], "selector", time.perf_counter() - t)
+            cheap += [chain[0][1], chain[1][1] if len(chain) > 1 else 0.0]
         p_cheap = float(self.cheap_model().predict(np.array([cheap]))[0])
         board.write("p_answerable_cheap", p_cheap, "calibrator")
         if p_cheap < SKIP_SPEAKER_BELOW:  # the speaker cannot make answering worth it: do not call it

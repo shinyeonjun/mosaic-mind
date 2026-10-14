@@ -104,11 +104,15 @@ def alone(llm, exam: str, item: dict, recent: dict) -> tuple[object, int]:
     return (-1 if g is None else g), 1
 
 
-def run(system: str) -> dict:
+def run(system: str, order: str = "grouped") -> dict:
     from cognitive_lab.mk1v2.arc import score as arc_score
     from cognitive_lab.mk1v2.llm_service import LLMService
 
     rows = []
+    others = subprocess.run(["nvidia-smi", "--query-compute-apps=pid,process_name", "--format=csv,noheader"],
+                            capture_output=True, text=True).stdout.strip()
+    if others or Vram.read() > 300:  # 2026-10-13: another program on the GPU made a run unusable; refuse to measure
+        raise SystemExit(f"the GPU is not free (in use: {Vram.read()} MiB; processes: {others or 'none listed'})")
     before = Vram.read()
     with Vram() as vram, LLMService("e2b" if system == "v3" else system, context=CONTEXT) as llm:
         after_server = Vram.read()
@@ -119,7 +123,15 @@ def run(system: str) -> dict:
             mk1 = MK1v3(llm, torch.device("cuda"))
         recent: dict[str, list] = {}
         started = time.perf_counter()
-        for n, (exam, item, truth) in enumerate(items(), 1):
+        stream = items()
+        if order == "mixed":  # kinds interleaved (task-stream items keep their order): swapping satellites shows up
+            from cognitive_lab.mk1v3.mixed import merge_streams
+
+            per = {}
+            for e, it, tr in stream:
+                per.setdefault(e, []).append((it, tr))
+            stream = merge_streams(per, seed="efficiency-mixed")
+        for n, (exam, item, truth) in enumerate(stream, 1):
             key = f"taskstream|{item['condition']}" if exam == "taskstream" else exam
             t = time.perf_counter()
             calls_before = llm.calls
@@ -145,14 +157,14 @@ def run(system: str) -> dict:
             rows.append({"key": key, "seconds": round(time.perf_counter() - t, 3), "speaker_calls": calls, "score": score})
             if n % 20 == 0:
                 print(f"  {n} items, {(time.perf_counter() - started) / 60:.1f} min, peak {vram.peak} MiB", flush=True)
-    out = {"system": system, "context": CONTEXT, "vram_mib": {"before": before, "after_server": after_server, "peak": vram.peak},
+    out = {"system": system, "order": order, "context": CONTEXT, "vram_mib": {"before": before, "after_server": after_server, "peak": vram.peak},
            "by_kind": {}, "rows": rows}
     for key in sorted({r["key"] for r in rows}):
         rs = [r for r in rows if r["key"] == key]
         out["by_kind"][key] = {"n": len(rs), "seconds_per_item": round(statistics.mean(r["seconds"] for r in rs), 2),
                                "speaker_calls_per_item": round(statistics.mean(r["speaker_calls"] for r in rs), 2),
                                "score": round(statistics.mean(r["score"] for r in rs), 3)}
-    (RESULTS / f"efficiency_{system}.json").write_text(json.dumps(out, indent=1), encoding="utf-8")
+    (RESULTS / f"efficiency_{system}{'' if order == 'grouped' else '-' + order}.json").write_text(json.dumps(out, indent=1), encoding="utf-8")
     print(json.dumps({k: v for k, v in out.items() if k != "rows"}, indent=1))
     return out
 
@@ -174,9 +186,10 @@ def compare() -> None:
 def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--system", choices=("v3", "e2b", "e4b"))
+    p.add_argument("--order", choices=("grouped", "mixed"), default="grouped")
     p.add_argument("--compare", action="store_true")
     a = p.parse_args()
-    compare() if a.compare else run(a.system)
+    compare() if a.compare else run(a.system, a.order)
 
 
 if __name__ == "__main__":
